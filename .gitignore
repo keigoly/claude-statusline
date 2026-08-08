@@ -1,0 +1,8 @@
+.DS_Store
+node_modules/
+*.log
+# 実行時に生成されるもの（本リポジトリの管理対象外・~/.claude 配下に出る）
+statusline-usage-cache.json
+statusline-usage-cache.json.lock
+# 公開前の開発履歴の退避先（ローカル専用）
+.archive/
