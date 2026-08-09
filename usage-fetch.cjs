@@ -109,6 +109,40 @@ async function fetchOpenRouter() {
   };
 }
 
+/**
+ * RunPod のクレジット残高。
+ *
+ * REST (rest.runpod.io/v1) に残高を返す口が無いため、旧 GraphQL の
+ * `myself { clientBalance }` を使う。**User-Agent が要る** — 既定の UA だと
+ * Cloudflare が 403 (error 1010) で弾く。
+ *
+ * OpenRouter と違い上限の概念が無い純粋なプリペイド残高なので base は持たない。
+ * 失敗時は null（呼び出し側が既存キャッシュを保つ）。
+ */
+async function fetchRunPod() {
+  const key = readSecret('RUNPOD_API_KEY');
+  if (!key) return null;
+  try {
+    const r = await fetch('https://api.runpod.io/graphql', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${key}`,
+        'Content-Type': 'application/json',
+        // 既定 UA だと Cloudflare に 403 で落とされる（2026-08-09 実測）
+        'User-Agent': 'claude-statusline/1.0',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ query: 'query { myself { clientBalance } }' }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const bal = j && j.data && j.data.myself && j.data.myself.clientBalance;
+    if (typeof bal !== 'number') return null;
+    return { balance: bal, fetchedAt: Math.floor(Date.now() / 1000) };
+  } catch (_) { return null; }
+}
+
 function readOAuth() {
   try {
     const raw = execSync(`security find-generic-password -s "${KEYCHAIN_SERVICE}" -w`, {
@@ -129,11 +163,14 @@ function toEpochSec(v) {
 async function main() {
   const prev = readCache();
 
-  // OpenRouter は Anthropic 側の成否と独立に取る（片方が落ちても他方は出続ける）。
-  const or = await fetchOpenRouter();
-  // Anthropic 側が取れなかった場合でも、OpenRouter が新しく取れていれば既存キャッシュへ載せて残す。
+  // 課金元は Anthropic 側の成否と独立に取る（片方が落ちても他方は出続ける）。
+  const [or, rp] = await Promise.all([fetchOpenRouter(), fetchRunPod()]);
+  // Anthropic 側が取れなかった場合でも、残額が新しく取れていれば既存キャッシュへ載せて残す。
   const bail = () => {
-    if (or) writeCache(Object.assign({}, prev || {}, { openrouter: or }));
+    const patch = {};
+    if (or) patch.openrouter = or;
+    if (rp) patch.runpod = rp;
+    if (Object.keys(patch).length) writeCache(Object.assign({}, prev || {}, patch));
     unlock();
   };
 
@@ -170,6 +207,7 @@ async function main() {
     overage: null,
     // 今回取れなければ前回値を残す（残額は緩やかにしか動かないため、欠落より鮮度落ちを選ぶ）
     openrouter: or || (prev && prev.openrouter) || null,
+    runpod: rp || (prev && prev.runpod) || null,
   };
   const limits = Array.isArray(data.limits) ? data.limits : [];
   for (const l of limits) {
