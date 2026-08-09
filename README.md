@@ -113,7 +113,8 @@ cat ~/.claude/statusline-usage-cache.json
 | --- | --- | --- |
 | `STATUSLINE_ICONS` | `nerd` | `emoji` で絵文字アイコンに切替 |
 | `STATUSLINE_EVENTS_DIR` | 未設定 | **外注経路の表示に必須**。ゲートウェイのイベント JSONL があるディレクトリ |
-| `STATUSLINE_ROUTE_WINDOW_SEC` | `900` | 外注経路を表示する時間窓（秒） |
+| `STATUSLINE_ROUTE_WINDOW_SEC` | `900` | 外注経路（完了済み）を表示する時間窓（秒） |
+| `STATUSLINE_ROUTE_INFLIGHT_WINDOW_SEC` | `180` | 生成中（`in_flight`）を表示する時間窓（秒）。完了行が書かれずに落ちた場合の貼り付き防止 |
 | `STATUSLINE_ROUTE_IGNORE_PROVIDERS` | `FakeProv` | 無視する配信事業者名（カンマ区切り）。テスト用の偽サーバを除外する |
 | `STATUSLINE_ENV_FILE` | 未設定 | `OPENROUTER_API_KEY` を読む dotenv 形式ファイルのパス |
 | `OPENROUTER_API_KEY` | 未設定 | **残額表示に必須**。直接指定するか `STATUSLINE_ENV_FILE` 経由 |
@@ -132,7 +133,16 @@ cat ~/.claude/statusline-usage-cache.json
  "payload":{"backend":"openrouter","model":"z-ai/glm-5.2","provider":"Novita"}}
 ```
 
-ファイル**末尾 64KB だけ**を読んで後方から走査し、`STATUSLINE_ROUTE_WINDOW_SEC` 以内で最初に見つかった 1 件を表示します。実測 0.110ms/回で、ネットワークもプロセス起動もしません。ディレクトリが無くても無害です。
+ファイル**末尾 64KB だけ**を読んで後方から走査し、時間窓以内で最初に見つかった 1 件を表示します。実測 0.110ms/回で、ネットワークもプロセス起動もしません。ディレクトリが無くても無害です。
+
+`payload.in_flight` が `true` の行は「呼び出し開始・完了前」を表し、配信事業者名の代わりに `⋯` を出します。
+
+```
+ Opus 5 → Gemini 3 Pro Image ⋯                    # 生成中
+ Opus 5 → Gemini 3 Pro Image · Google AI Studio   # 完了
+```
+
+行は追記順＝時系列なので、完了行は開始行より後ろにあり自然に勝ちます。完了行が書かれないまま落ちた場合に「生成中」が居座らないよう、`in_flight` の行だけは `STATUSLINE_ROUTE_INFLIGHT_WINDOW_SEC`（既定 180 秒）という短い窓で切ります。画像生成は 1 枚 20〜60 秒なので正常系はこれで覆えます。
 
 `model` は `z-ai/glm-5.2` → `GLM 5.2`、`deepseek/deepseek-v4-pro` → `DeepSeek V4 Pro` のように整形されます。未知の slug も機械的に整形されるため、外注先が増えても壊れません。
 

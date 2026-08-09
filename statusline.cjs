@@ -39,10 +39,11 @@ const ICONS = {
     pr:     '\u{E726}',  //  (git pull request)
     reset:  '\u{F021}',  //  (refresh / reset)
     route:  '\u{2192}',  // → (外注経路の矢印。U+2192 は等幅フォントに必ずある字形を選ぶ)
+    inflight: '\u{22EF}', // ⋯ (生成中。route と同じく等幅で必ず出る字形に限る)
   },
   emoji: {
     folder: '📁', repo: '🐙', branch: '🌿', ctx: '🧠', model: '💪', rate: '💰', pr: 'PR', reset: '🔄',
-    route: '→',
+    route: '→', inflight: '⋯',
   },
 };
 const I = ICONS[ICON_SET] || ICONS.nerd;
@@ -206,6 +207,10 @@ function maybeRefreshUsage() {
 // STATUSLINE_EVENTS_DIR が未設定なら機能ごと無効（矢印は出ない）。既定パスは持たない。
 const EVENTS_DIR = process.env.STATUSLINE_EVENTS_DIR || null;
 const ROUTE_WINDOW_SEC = Number(process.env.STATUSLINE_ROUTE_WINDOW_SEC) || 900; // 既定 15 分
+// 完了前（in_flight）の行は別の窓で切る。生成が落ちて完了行が書かれないまま
+// 終わった場合、15 分も「生成中」を出し続けると嘘になるため短くする。
+// 画像生成の実測は 1 枚 30-60 秒なので 180 秒あれば正常系は覆える。
+const ROUTE_INFLIGHT_WINDOW_SEC = Number(process.env.STATUSLINE_ROUTE_INFLIGHT_WINDOW_SEC) || 180;
 const ROUTE_TAIL_BYTES = 64 * 1024; // 1 日 30KB 前後を想定。末尾だけ読めば足りる
 // テスト用の偽サーバ名を除外する（カンマ区切り）。既定は "FakeProv"。
 // ゲートウェイの回帰テストが本番ログへ書き込む構成だと、これが無いとテストのたびに誤表示される。
@@ -238,10 +243,14 @@ function tailLines(file, bytes) {
   }
 }
 
-// 直近 ROUTE_WINDOW_SEC 以内の OpenRouter 呼び出しを 1 件返す（無ければ null）
+// 直近の OpenRouter 呼び出しを 1 件返す（無ければ null）
+//
+// 行は追記順＝時系列なので、末尾から遡って最初に当たった 1 件が「最新の状態」。
+// 生成開始（in_flight:true）の後に完了行が来ていれば、完了行の方が後ろにあるので
+// 自然に勝つ。完了行がまだ無ければ開始行に当たり、「生成中」を出せる。
 function readRoute() {
   if (!EVENTS_DIR) return null; // 未設定＝機能オフ
-  const cutoff = Date.now() - ROUTE_WINDOW_SEC * 1000;
+  const now = Date.now();
   for (const off of [0, -1]) { // JST の日跨ぎ直後は前日ファイルにも当たる
     const lines = tailLines(path.join(EVENTS_DIR, `events_${jstDateStr(off)}.jsonl`), ROUTE_TAIL_BYTES);
     for (let i = lines.length - 1; i >= 0; i--) {
@@ -253,7 +262,10 @@ function readRoute() {
       if (p.provider && ROUTE_IGNORE.has(p.provider)) continue; // テスト用の偽サーバ
       const ts = Date.parse(e.timestamp);
       if (!Number.isFinite(ts)) continue;
-      return ts >= cutoff ? { model: p.model, provider: p.provider || null } : null; // 最新が窓外なら出さない
+      const inFlight = p.in_flight === true;
+      const window = inFlight ? ROUTE_INFLIGHT_WINDOW_SEC : ROUTE_WINDOW_SEC;
+      if (ts < now - window * 1000) return null; // 最新が窓外なら出さない
+      return { model: p.model, provider: p.provider || null, inFlight, kind: p.kind || null };
     }
   }
   return null;
@@ -321,7 +333,10 @@ function render(data) {
     const route = readRoute();
     if (route) {
       m += ` ${C.gray}${I.route}${C.reset} ${paint(routeLabel(route.model), C.route)}`;
-      if (route.provider) m += ` ${C.dim}· ${route.provider}${C.reset}`;
+      // 完了前は配信事業者がまだ判らないので、代わりに「生成中」を示す。
+      // 画像は 30-60 秒かかるため、この表示が無いと無反応に見える。
+      if (route.inFlight) m += ` ${C.yellow}${I.inflight}${C.reset}`;
+      else if (route.provider) m += ` ${C.dim}· ${route.provider}${C.reset}`;
     }
     seg3.push(`${ic(I.model)} ${m}`);
   }
