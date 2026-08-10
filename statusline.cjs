@@ -254,11 +254,12 @@ function readRoute() {
   for (const off of [0, -1]) { // JST の日跨ぎ直後は前日ファイルにも当たる
     const lines = tailLines(path.join(EVENTS_DIR, `events_${jstDateStr(off)}.jsonl`), ROUTE_TAIL_BYTES);
     for (let i = lines.length - 1; i >= 0; i--) {
-      if (lines[i].indexOf('"openrouter"') < 0) continue; // JSON.parse 前の粗フィルタ
+      // JSON.parse 前の粗フィルタ。openrouter(テキスト/画像) と comfyui(画像) の両方を拾う。
+      if (lines[i].indexOf('"openrouter"') < 0 && lines[i].indexOf('"comfyui"') < 0) continue;
       let e;
       try { e = JSON.parse(lines[i]); } catch (_) { continue; }
       const p = e && e.payload;
-      if (!p || p.backend !== 'openrouter' || !p.model) continue;
+      if (!p || (p.backend !== 'openrouter' && p.backend !== 'comfyui') || !p.model) continue;
       if (p.provider && ROUTE_IGNORE.has(p.provider)) continue; // テスト用の偽サーバ
       const ts = Date.parse(e.timestamp);
       if (!Number.isFinite(ts)) continue;
@@ -369,6 +370,15 @@ function render(data) {
   if (or && typeof or.remaining === 'number') {
     const usedPct = or.base > 0 ? Math.max(0, Math.min(100, 100 - (or.remaining / or.base) * 100)) : 0;
     seg4.push(`OR ${paint(fmtUsd(or.remaining), barColor(usedPct))}`);
+  }
+  // RunPod 残額。純粋なプリペイドで上限の概念が無いため、％ではなく実額の絶対値で
+  // 着色する（$5 未満で警告、$1 未満で危険）。ここが枯れると画像生成が全停止し、
+  // ネットワークボリューム（=モデル）ごと失われ得るので、残額は常に見えている方がよい。
+  const rp = usage && usage.runpod;
+  if (rp && typeof rp.balance === 'number') {
+    // 色は barColor と同じ語彙（緑→黄→赤）にそろえる
+    const c = rp.balance < 1 ? '\x1b[38;5;196m' : rp.balance < 5 ? '\x1b[38;5;226m' : C.green;
+    seg4.push(`RP ${paint(fmtUsd(rp.balance), c)}`);
   }
   if (seg4.length) lines.push(`${ic(I.rate)} ${seg4.join(SEP)}`);
 
