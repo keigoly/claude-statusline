@@ -2,7 +2,7 @@
 /**
  * Claude Code ステータスライン — 多段表示
  *   1) [folder] カレントフォルダ（~ 省略）
- *   2) [repo] リポジトリ名 │ [branch] ブランチ
+ *   2) [repo] リポジトリ名 │ [branch] ブランチ [→ 作業中の worktree のブランチ]
  *   3) [ctx] コンテキスト使用量バー │ [model] モデル/工数(effort) [→ OpenRouter 外注先 · 配信事業者]
  *   4) [rate] 5h 使用率 ([reset] リセット) │ 7d 使用率 ([reset] リセット) │ OR 残額   ← Pro/Max のみ・初回応答後に出現
  *   5) [pr] PR #番号
@@ -18,7 +18,9 @@
  *   - 使用率バー/％ … 0-30%=緑 / 31-60%=黄 / 61-90%=赤 / 91%+=紫
  *
  * 要 Nerd Font（端末側のフォント設定で指定する）。
- * `STATUSLINE_ICONS=emoji` で絵文字にフォールバック。例外時も最低1行返す。git 1回のみ・ネットワーク無し。
+ * `STATUSLINE_ICONS=emoji` で絵文字にフォールバック。例外時も最低1行返す。ネットワーク無し。
+ * git は通常 1 回。`~/.claude/statusline-worktree/<session_id>.json` がある場合のみ
+ * 作業中 worktree の確認で最大 3 回増える（実測 1 回あたり約 0.17 秒・全体で変化なし）。
  */
 'use strict';
 const { execSync } = require('node:child_process');
@@ -118,6 +120,47 @@ function gitBranch(cwd) {
   const opts = { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 800 };
   try { return execSync('git symbolic-ref --quiet --short HEAD', opts).trim(); } catch (_) {}
   try { return execSync('git rev-parse --short HEAD', opts).trim(); } catch (_) { return ''; }
+}
+
+// ---- 作業中の git worktree ----
+// **cwd のブランチが実態とは限らない。** ブランチ作業を専用 worktree で行う運用だと、
+// エージェントのセッションは cwd をベースツリー（main）に置いたまま、実際の編集は
+// 別ディレクトリで進む。cwd しか見ないと「ブランチを切り替え忘れている」ように見える。
+//
+// 置き換えではなく併記する。cwd が main であること自体は事実なので、これを消すと
+// 別の嘘になる。`main → feat/xxx` と出せばどちらも正しく読める。
+//
+// マーカーはセッション単位（`~/.claude/statusline-worktree/<session_id>.json`）。
+// 同じベースツリーを複数セッションが共有するため、リポジトリ単位だと他人の
+// worktree を指す。書き手は worktree 作成スクリプト側。
+//
+// **1 セッションが複数リポジトリを触る**ので、中身はリポジトリごとの表にする。
+// キーは git-common-dir（worktree 間で共有され、ベースツリーと worktree で同じ値）。
+//   {"worktrees": {"<git-common-dir>": "<worktree の絶対パス>"}}
+// キー自体がリポジトリの同一性なので、引けた時点で別リポジトリの混入は無い。
+//
+// 無い/壊れている/パスが消えた場合は、黙って従来表示に戻す（fail-open）。
+// **古いマーカーで嘘を出さないことを、表示することより優先する。**
+function gitCommonDir(dir) {
+  try {
+    const out = execSync('git rev-parse --git-common-dir', {
+      cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 800,
+    }).trim();
+    return out ? fs.realpathSync(path.resolve(dir, out)) : '';
+  } catch (_) { return ''; }
+}
+
+// このセッションが cwd のリポジトリで作業している worktree の絶対パス（無ければ ''）
+function activeWorktreePath(cwd, sessionId) {
+  if (!sessionId) return '';
+  try {
+    const f = path.join(os.homedir(), '.claude', 'statusline-worktree', `${sessionId}.json`);
+    const m = JSON.parse(fs.readFileSync(f, 'utf8')) || {};
+    const key = gitCommonDir(cwd);
+    if (!key) return '';
+    const wt = (m.worktrees || {})[key];
+    return wt && fs.existsSync(wt) ? wt : '';
+  } catch (_) { return ''; }
 }
 
 function bar(pct, width = 10) {
@@ -243,16 +286,14 @@ function tailLines(file, bytes) {
   }
 }
 
-// 直近の OpenRouter 呼び出しを 1 件返す（無ければ null）
+// 1 ディレクトリから「最後に書かれた外注 1 件」を返す（時間の窓はここでは見ない）
 //
 // 行は追記順＝時系列なので、末尾から遡って最初に当たった 1 件が「最新の状態」。
 // 生成開始（in_flight:true）の後に完了行が来ていれば、完了行の方が後ろにあるので
 // 自然に勝つ。完了行がまだ無ければ開始行に当たり、「生成中」を出せる。
-function readRoute() {
-  if (!EVENTS_DIR) return null; // 未設定＝機能オフ
-  const now = Date.now();
+function latestRouteIn(dir) {
   for (const off of [0, -1]) { // JST の日跨ぎ直後は前日ファイルにも当たる
-    const lines = tailLines(path.join(EVENTS_DIR, `events_${jstDateStr(off)}.jsonl`), ROUTE_TAIL_BYTES);
+    const lines = tailLines(path.join(dir, `events_${jstDateStr(off)}.jsonl`), ROUTE_TAIL_BYTES);
     for (let i = lines.length - 1; i >= 0; i--) {
       // JSON.parse 前の粗フィルタ。openrouter(テキスト/画像) と comfyui(画像) の両方を拾う。
       if (lines[i].indexOf('"openrouter"') < 0 && lines[i].indexOf('"comfyui"') < 0) continue;
@@ -263,13 +304,60 @@ function readRoute() {
       if (p.provider && ROUTE_IGNORE.has(p.provider)) continue; // テスト用の偽サーバ
       const ts = Date.parse(e.timestamp);
       if (!Number.isFinite(ts)) continue;
-      const inFlight = p.in_flight === true;
-      const window = inFlight ? ROUTE_INFLIGHT_WINDOW_SEC : ROUTE_WINDOW_SEC;
-      if (ts < now - window * 1000) return null; // 最新が窓外なら出さない
-      return { model: p.model, provider: p.provider || null, inFlight, kind: p.kind || null };
+      return {
+        ts, model: p.model, provider: p.provider || null,
+        inFlight: p.in_flight === true, kind: p.kind || null,
+      };
     }
   }
   return null;
+}
+
+// 直近の外注を 1 件返す（無ければ null）。複数のイベント置き場を突き合わせ、
+// **最も新しいものを採る**。
+function readRoute(dirs) {
+  const now = Date.now();
+  let best = null;
+  for (const d of dirs) {
+    const r = latestRouteIn(d);
+    if (r && (!best || r.ts > best.ts)) best = r;
+  }
+  if (!best) return null;
+  const window = best.inFlight ? ROUTE_INFLIGHT_WINDOW_SEC : ROUTE_WINDOW_SEC;
+  if (best.ts < now - window * 1000) return null; // 最新が窓外なら出さない
+  return best;
+}
+
+function gitToplevel(dir) {
+  try {
+    return execSync('git rev-parse --show-toplevel', {
+      cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 800,
+    }).trim();
+  } catch (_) { return ''; }
+}
+
+// 読むべきイベント置き場の一覧。
+//
+// **worktree で実行したぶんを取りこぼさない** (2026-08-13 に実機で判明)。
+// 呼び出し元リポジトリの observability は**モジュールの位置**を基準に書き込み先を
+// 決めるため、worktree からスクリプトを走らせるとイベントは
+// `<worktree>/observability/state/` に落ちる。ベースツリーだけを見ていると、
+// OpenRouter へも RunPod へも実際には外注しているのに、ステータスラインには
+// 何も出ない (実測: OpenRouter 40 件 / ComfyUI 64 件を丸ごと見落としていた)。
+//
+// 置き場の**相対位置**を EVENTS_DIR から求めて worktree 側に当てる。
+// "observability/state" を直接書かないのは、この構成に依存しないため。
+function eventsDirs(cwd, wtPath) {
+  const dirs = [];
+  if (!EVENTS_DIR) return dirs; // 未設定＝機能オフ
+  dirs.push(EVENTS_DIR);
+  if (!wtPath) return dirs;
+  const top = gitToplevel(cwd);
+  if (!top) return dirs;
+  const rel = path.relative(top, EVENTS_DIR);
+  // EVENTS_DIR がリポジトリの外にあるなら worktree 側に対応物は無い
+  if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) dirs.push(path.join(wtPath, rel));
+  return dirs;
 }
 
 // "z-ai/glm-5.2" → "GLM 5.2" / "deepseek/deepseek-v4-pro" → "DeepSeek V4 Pro"
@@ -308,6 +396,8 @@ function render(data) {
   const pct = Math.floor(Number(cw.used_percentage) || 0);
   const repoName = (ws.repo && ws.repo.name) || '';
   const branch = gitBranch(cwd);
+  // 作業中 worktree は「ブランチ表示」と「イベント置き場」の両方で要るので 1 回だけ引く
+  const wtPath = activeWorktreePath(cwd, data.session_id);
   const rl = data.rate_limits || {};
   const pr = data.pr || {};
   const lines = [];
@@ -318,7 +408,15 @@ function render(data) {
   // 2) リポジトリ │ ブランチ
   const seg2 = [];
   if (repoName) seg2.push(`${ic(I.repo)} ${paint(repoName, C.blue)}`);
-  if (branch) seg2.push(`${ic(I.branch)} ${paint(branch, C.green)}`);
+  if (branch) {
+    // 作業中の worktree が別ブランチなら「cwd のブランチ → 作業中のブランチ」と併記する。
+    // 同じブランチなら足さない（情報が増えないうえ、見た目が変わる理由も無い）。
+    const wt = wtPath ? gitBranch(wtPath) : '';
+    const text = (wt && wt !== branch)
+      ? `${paint(branch, C.green)} ${C.gray}→${C.reset} ${paint(wt, C.yellow)}`
+      : paint(branch, C.green);
+    seg2.push(`${ic(I.branch)} ${text}`);
+  }
   if (seg2.length) lines.push(seg2.join(SEP));
 
   // 3) コンテキスト │ モデル(/工数)
@@ -331,7 +429,7 @@ function render(data) {
     let m = effort ? `${modelText}${C.gray}/${effortColor}${effort}${C.reset}` : modelText;
     // OpenRouter へ外注していた場合のみ「→ 外注先モデル · 配信事業者」を足す。
     // 直近 ROUTE_WINDOW_SEC 以内に実績が無ければ何も出さない（現状の見た目のまま）。
-    const route = readRoute();
+    const route = readRoute(eventsDirs(cwd, wtPath));
     if (route) {
       m += ` ${C.gray}${I.route}${C.reset} ${paint(routeLabel(route.model), C.route)}`;
       // 完了前は配信事業者がまだ判らないので、代わりに「生成中」を示す。
