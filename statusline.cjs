@@ -110,6 +110,29 @@ function barColor(p) {
        :           C.green;          // 緑（現状の緑）
 }
 
+// 残額（USD）の色: >$15=緑 / $15以下=黄 / $10以下=赤 / $5以下=紫
+//
+// 使用率（barColor）とは別規則にしている。残額は「上限に対する割合」ではなく
+// 「あと何ドル使えるか」で危険度が決まるため（上限 $50 の 30% 残と $5 の 30% 残では
+// 意味が違う）。OpenRouter / RunPod の両方でこの絶対額のしきい値にそろえる。
+function balanceColor(v) {
+  return v <= 5  ? '\x1b[38;5;129m' // 紫
+       : v <= 10 ? '\x1b[38;5;196m' // 赤
+       : v <= 15 ? '\x1b[38;5;226m' // 黄
+       :           C.green;
+}
+
+// Anlas 残高の色。**USD の balanceColor とは別規則。**
+// Opus の月間付与が 10,000 で、Character Reference 付き生成が 1 枚 5、
+// 1216x1856 まで上げると 49。つまり 1,000 を切ると本番構図で 20 枚しか引けない。
+// そこを赤、月の 1/5 を割ったところを黄にしてある。
+function anlasColor(v) {
+  return v < 500   ? '\x1b[38;5;129m' // 紫（ほぼ枯渇）
+       : v < 1000  ? '\x1b[38;5;196m' // 赤
+       : v < 2000  ? '\x1b[38;5;226m' // 黄
+       :             C.green;
+}
+
 function abbrevHome(p, home) {
   if (home && p && (p === home || p.startsWith(home + '/'))) return '~' + p.slice(home.length);
   return p;
@@ -463,20 +486,27 @@ function render(data) {
     for (const b of usage.scoped) { const s = renderScoped(b); if (s) seg4.push(s); }
   }
   // OpenRouter 残額（背景キャッシュ由来）。min(クレジット残高, キー期間上限残) = 実際に使い切れる額。
-  // 着色は使用率と同じ規則にそろえる（残りが減る＝使用率が上がる、と読み替える）。
+  // 着色は balanceColor（残額の絶対値）。使用率ではなく「あと何ドル使えるか」で危険度が決まるため。
   const or = usage && usage.openrouter;
   if (or && typeof or.remaining === 'number') {
-    const usedPct = or.base > 0 ? Math.max(0, Math.min(100, 100 - (or.remaining / or.base) * 100)) : 0;
-    seg4.push(`OR ${paint(fmtUsd(or.remaining), barColor(usedPct))}`);
+    seg4.push(`OR ${paint(fmtUsd(or.remaining), balanceColor(or.remaining))}`);
   }
-  // RunPod 残額。純粋なプリペイドで上限の概念が無いため、％ではなく実額の絶対値で
-  // 着色する（$5 未満で警告、$1 未満で危険）。ここが枯れると画像生成が全停止し、
-  // ネットワークボリューム（=モデル）ごと失われ得るので、残額は常に見えている方がよい。
+  // RunPod 残額。純粋なプリペイドで上限の概念が無いため、％ではなく実額の絶対値で着色する。
+  // ここが枯れると画像生成が全停止し、ネットワークボリューム（=モデル）ごと失われ得るので、
+  // 残額は常に見えている方がよい。しきい値は OpenRouter と共通（balanceColor）。
   const rp = usage && usage.runpod;
   if (rp && typeof rp.balance === 'number') {
-    // 色は barColor と同じ語彙（緑→黄→赤）にそろえる
-    const c = rp.balance < 1 ? '\x1b[38;5;196m' : rp.balance < 5 ? '\x1b[38;5;226m' : C.green;
-    seg4.push(`RP ${paint(fmtUsd(rp.balance), c)}`);
+    seg4.push(`RP ${paint(fmtUsd(rp.balance), balanceColor(rp.balance))}`);
+  }
+  // NovelAI の Anlas 残高。**USD ではないので balanceColor は使えない**
+  // （あちらはドルの絶対額に合わせたしきい値）。Opus の月間付与 10,000 を基準に、
+  // 1 か月ぶんの余力がどれだけ残っているかで着色する。
+  // 契約が切れていると生成そのものが止まるので、その場合は残高より先に赤で出す。
+  const nai = usage && usage.novelai;
+  if (nai && typeof nai.anlas === 'number') {
+    const label = nai.active === false ? paint('NAI 停止', C.red)
+      : `NAI ${paint(String(nai.anlas), anlasColor(nai.anlas))}`;
+    seg4.push(label);
   }
   if (seg4.length) lines.push(`${ic(I.rate)} ${seg4.join(SEP)}`);
 

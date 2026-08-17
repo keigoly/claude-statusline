@@ -143,6 +143,47 @@ async function fetchRunPod() {
   } catch (_) { return null; }
 }
 
+/**
+ * NovelAI の Anlas 残高。
+ *
+ * **ホストは `image.novelai.net`。** `api.novelai.net` は 400 で
+ * 「third-party tool は image URL へ更新せよ」と返す（2026-08-17 実測）。
+ * 「NovelAI の画像 API は 2024 年に廃止された」という記述が各所に残っているが、
+ * 実際は移転しただけで、この誤情報の出どころがここ。
+ *
+ * Anlas は API では `trainingStepsLeft.fixedTrainingStepsLeft` という名前で返る
+ * （元は学習ステップ数だった名残）。サブスクの定額なので USD 残高は存在せず、
+ * 従量なのはこの Anlas だけ。Opus は月 10,000 付与。
+ *
+ * **UA が要る** — DNS/CDN/TLS 終端がすべて Cloudflare のため、既定 UA だと弾かれる。
+ * 失敗時は null（呼び出し側が既存キャッシュを保つ）。
+ */
+async function fetchNovelAI() {
+  const key = readSecret('NOVELAI_API_KEY');
+  if (!key) return null;
+  try {
+    const r = await fetch('https://image.novelai.net/user/subscription', {
+      headers: {
+        'Authorization': `Bearer ${key}`,
+        'User-Agent': 'claude-statusline/1.0',
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const anlas = j && j.trainingStepsLeft && j.trainingStepsLeft.fixedTrainingStepsLeft;
+    if (typeof anlas !== 'number') return null;
+    return {
+      anlas,
+      tier: typeof j.tier === 'number' ? j.tier : null,
+      active: !!j.active,
+      expiresAt: typeof j.expiresAt === 'number' ? j.expiresAt : null,
+      fetchedAt: Math.floor(Date.now() / 1000),
+    };
+  } catch (_) { return null; }
+}
+
 function readOAuth() {
   try {
     const raw = execSync(`security find-generic-password -s "${KEYCHAIN_SERVICE}" -w`, {
@@ -164,12 +205,15 @@ async function main() {
   const prev = readCache();
 
   // 課金元は Anthropic 側の成否と独立に取る（片方が落ちても他方は出続ける）。
-  const [or, rp] = await Promise.all([fetchOpenRouter(), fetchRunPod()]);
+  const [or, rp, nai] = await Promise.all([
+    fetchOpenRouter(), fetchRunPod(), fetchNovelAI(),
+  ]);
   // Anthropic 側が取れなかった場合でも、残額が新しく取れていれば既存キャッシュへ載せて残す。
   const bail = () => {
     const patch = {};
     if (or) patch.openrouter = or;
     if (rp) patch.runpod = rp;
+    if (nai) patch.novelai = nai;
     if (Object.keys(patch).length) writeCache(Object.assign({}, prev || {}, patch));
     unlock();
   };
@@ -208,6 +252,7 @@ async function main() {
     // 今回取れなければ前回値を残す（残額は緩やかにしか動かないため、欠落より鮮度落ちを選ぶ）
     openrouter: or || (prev && prev.openrouter) || null,
     runpod: rp || (prev && prev.runpod) || null,
+    novelai: nai || (prev && prev.novelai) || null,
   };
   const limits = Array.isArray(data.limits) ? data.limits : [];
   for (const l of limits) {
