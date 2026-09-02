@@ -80,6 +80,26 @@ OAuth トークンを読むだけで、リフレッシュは本体に任せる�
 Anthropic 側と OpenRouter 側は**独立に取得**する。片方が落ちても、もう片方が取れていれば
 キャッシュへ載せる。これにより片方の障害でもう片方の表示が消えることはない。
 
+## 主ツリーの運用違反表示 (2 行目)
+
+「主ツリーは常に既定ブランチ (main)」「linked worktree は既定ブランチを掴まない」という運用の**違反だけ**を
+赤＋警告記号で出す。正常時の見た目は従来どおり (緑のブランチ名)。
+
+- `主ツリー≠main` … 主ツリー (`.git` が実ディレクトリのツリー) が既定ブランチ以外にいる。cmux の全ワークスペース・
+  仕事用アカウント・launchd が同じ状態を見ている
+- `worktree が main を保持` … linked worktree (`.git` が `gitdir:` を書いたファイル) が既定ブランチにいる。
+  主ツリーは既定ブランチへ戻れなくなっている
+
+2026-09-02、主ツリーが 10 日間 feat ブランチのままだったが、ブランチ名を正しく出していただけでは異常が正常に
+見えて誰も気づかなかった。**正しい表示と、異常が伝わる表示は別物。**
+
+判定は **git を叩かず fs だけ**で行う (`treeRole()`)。描画は毎秒数回走るので git 起動を増やさない
+(実測: 変更前後で差なし)。既定ブランチは `refs/remotes/origin/HEAD` → `main` → `master` の順
+(packed-refs も見る)。判定できなければ従来表示 (fail-open)。
+
+同時に `C.red` を定義した。以前から `NAI 停止` が `C.red` を参照していたが未定義で、`undefined` の文字列が
+そのまま出ていた。
+
 ## 変更手順
 
 1. **見える化**: 変更前にモック描画で現状を把握する。色は `sed 's/\x1b\[[0-9;]*m//g'` で除去すると構造だけ確認できる
@@ -106,6 +126,21 @@ echo '{"model":{"display_name":"Opus 5"},"workspace":{"current_dir":"/tmp/demo"}
 
 必ず通すパターン: ①外注なし ②窓内に外注あり ③別モデルへの外注 ④窓外（矢印が消える）
 ⑤除外対象の事業者のみ（矢印が出ない）⑥イベントディレクトリ不在 ⑦`openrouter` を含まない旧キャッシュ。
+
+主ツリーの運用違反表示は、一時リポジトリで次を通す (色は `sed 's/\x1b\[[0-9;]*m//g'` で除去して構造を見る):
+
+```sh
+D=$(mktemp -d); git init -q -b main "$D" && git -C "$D" commit -q --allow-empty -m init
+git -C "$D" branch feat/x && git -C "$D" worktree add -q "$D-feat" feat/x
+r() { printf '{"workspace":{"current_dir":"%s","repo":{"name":"t"}}}' "$1" | node statusline.cjs | sed -n 2p; }
+r "$D"                                   # ① 主ツリー main → 緑
+git -C "$D" switch -q feat/x 2>/dev/null || { git -C "$D" branch feat/y; git -C "$D" switch -q feat/y; }
+r "$D"                                   # ② 主ツリー feat → 赤「主ツリー≠main」
+r "$D-feat"                              # ③ worktree feat → 緑
+git -C "$D" worktree add -q "$D-main" main
+r "$D-main"                              # ④ worktree が main → 赤「worktree が main を保持」
+r "$D/sub" 2>/dev/null; r /tmp           # ⑤ サブディレクトリでも判定 / git 外は行ごと消える
+```
 
 ## 関連
 
