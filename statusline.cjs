@@ -3,6 +3,7 @@
  * Claude Code ステータスライン — 多段表示
  *   1) [folder] カレントフォルダ（~ 省略）
  *   2) [repo] リポジトリ名 │ [branch] ブランチ [→ 作業中の worktree のブランチ]
+ *        主ツリーが既定ブランチ(main)以外 / linked worktree が既定ブランチを保持 なら赤＋警告記号
  *   3) [ctx] コンテキスト使用量バー │ [model] モデル/工数(effort) [→ OpenRouter 外注先 · 配信事業者]
  *   4) [rate] 5h 使用率 ([reset] リセット) │ 7d 使用率 ([reset] リセット) │ OR 残額   ← Pro/Max のみ・初回応答後に出現
  *   5) [pr] PR #番号
@@ -42,10 +43,11 @@ const ICONS = {
     reset:  '\u{F021}',  //  (refresh / reset)
     route:  '\u{2192}',  // → (外注経路の矢印。U+2192 は等幅フォントに必ずある字形を選ぶ)
     inflight: '\u{22EF}', // ⋯ (生成中。route と同じく等幅で必ず出る字形に限る)
+    warn:   '\u{F071}',  //  (warning triangle。運用違反の印)
   },
   emoji: {
     folder: '📁', repo: '🐙', branch: '🌿', ctx: '🧠', model: '💪', rate: '💰', pr: 'PR', reset: '🔄',
-    route: '→', inflight: '⋯',
+    route: '→', inflight: '⋯', warn: '⚠',
   },
 };
 const I = ICONS[ICON_SET] || ICONS.nerd;
@@ -63,6 +65,7 @@ const C = {
   orange: '\x1b[38;2;255;106;0m', // アイコン色（#FF6A00）
   gold: '\x1b[38;5;220m',         // プラン種別（Max 20x 等）
   route: '\x1b[38;2;167;139;250m',// 外注先モデル名（外部＝自前のモデル配色と混ざらない藤色）
+  red: '\x1b[38;5;196m',          // 警告（主ツリーの運用違反・NAI 停止）
 };
 const paint = (s, c) => `${c}${s}${C.reset}`;
 const SEP = ` ${C.gray}│${C.reset} `;
@@ -143,6 +146,58 @@ function gitBranch(cwd) {
   const opts = { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 800 };
   try { return execSync('git symbolic-ref --quiet --short HEAD', opts).trim(); } catch (_) {}
   try { return execSync('git rev-parse --short HEAD', opts).trim(); } catch (_) { return ''; }
+}
+
+// ---- 主ツリーの運用違反（git を叩かず fs だけで判定）----
+// 「主ツリーは常に既定ブランチ(main)」「linked worktree は既定ブランチを掴まない」という運用の
+// **違反だけ** を赤く出す。2026-09-02、主ツリーが 10 日間 feat ブランチのままだったが、
+// ブランチ名を正しく表示していただけでは異常が正常に見え、誰も気づかなかった。
+//
+// 判定は `.git` の実体で行う。主ツリーは `.git` が **ディレクトリ**、linked worktree は
+// `gitdir: <common>/worktrees/<name>` を書いた **ファイル**。既定ブランチは
+// `refs/remotes/origin/HEAD` → main → master の順で決める（packed-refs も見る）。
+// 全て fs 読みなので、描画ごとの git 起動回数は増えない。判定できなければ従来表示（fail-open）。
+function findGitEntry(dir) {
+  let d = path.resolve(dir);
+  for (let i = 0; i < 64; i++) {
+    const g = path.join(d, '.git');
+    try {
+      const st = fs.statSync(g);
+      return { top: d, entry: g, isDir: st.isDirectory() };
+    } catch (_) {}
+    const parent = path.dirname(d);
+    if (parent === d) return null;
+    d = parent;
+  }
+  return null;
+}
+function protectedBranchOf(commonDir) {
+  try {
+    const head = fs.readFileSync(path.join(commonDir, 'refs', 'remotes', 'origin', 'HEAD'), 'utf8').trim();
+    const m = /^ref: refs\/remotes\/origin\/(.+)$/.exec(head);
+    if (m) return m[1];
+  } catch (_) {}
+  let packed = '';
+  try { packed = fs.readFileSync(path.join(commonDir, 'packed-refs'), 'utf8'); } catch (_) {}
+  for (const b of ['main', 'master']) {
+    if (fs.existsSync(path.join(commonDir, 'refs', 'heads', b))) return b;
+    if (new RegExp(` refs/heads/${b}(\\n|$)`).test(packed)) return b;
+  }
+  return '';
+}
+// cwd が属するツリーの役割。{ kind: 'primary' | 'linked' | '', protected: 既定ブランチ名 }
+function treeRole(cwd) {
+  try {
+    const g = findGitEntry(cwd);
+    if (!g) return { kind: '', protected: '' };
+    if (g.isDir) return { kind: 'primary', protected: protectedBranchOf(g.entry) };
+    const m = /^gitdir:\s*(.+)$/m.exec(fs.readFileSync(g.entry, 'utf8'));
+    if (!m) return { kind: '', protected: '' };
+    const gitDir = path.resolve(g.top, m[1].trim());
+    // <common>/worktrees/<name> の形だけを linked worktree と見なす（submodule の modules/ は対象外）
+    if (path.basename(path.dirname(gitDir)) !== 'worktrees') return { kind: '', protected: '' };
+    return { kind: 'linked', protected: protectedBranchOf(path.dirname(path.dirname(gitDir))) };
+  } catch (_) { return { kind: '', protected: '' }; }
 }
 
 // ---- 作業中の git worktree ----
@@ -432,12 +487,20 @@ function render(data) {
   const seg2 = [];
   if (repoName) seg2.push(`${ic(I.repo)} ${paint(repoName, C.blue)}`);
   if (branch) {
+    // 運用違反だけ赤く出す（正常時は従来どおり緑）。
+    //   主ツリーが既定ブランチ以外 … 全ワークスペース・別アカウント・launchd が同じ状態を見ている
+    //   linked worktree が既定ブランチ … 主ツリーが既定ブランチへ戻れなくなっている
+    const role = treeRole(cwd);
+    let base = paint(branch, C.green);
+    if (role.kind === 'primary' && role.protected && branch !== role.protected) {
+      base = `${C.red}${I.warn} ${branch}${C.reset} ${C.gray}主ツリー≠${role.protected}${C.reset}`;
+    } else if (role.kind === 'linked' && role.protected && branch === role.protected) {
+      base = `${C.red}${I.warn} ${branch}${C.reset} ${C.gray}worktree が ${role.protected} を保持${C.reset}`;
+    }
     // 作業中の worktree が別ブランチなら「cwd のブランチ → 作業中のブランチ」と併記する。
     // 同じブランチなら足さない（情報が増えないうえ、見た目が変わる理由も無い）。
     const wt = wtPath ? gitBranch(wtPath) : '';
-    const text = (wt && wt !== branch)
-      ? `${paint(branch, C.green)} ${C.gray}→${C.reset} ${paint(wt, C.yellow)}`
-      : paint(branch, C.green);
+    const text = (wt && wt !== branch) ? `${base} ${C.gray}→${C.reset} ${paint(wt, C.yellow)}` : base;
     seg2.push(`${ic(I.branch)} ${text}`);
   }
   if (seg2.length) lines.push(seg2.join(SEP));
