@@ -301,8 +301,9 @@ function fmtDateTime(epoch) {
 // ---- プラン使用制限（Max 20x 等）＆ 週間モデル別制限（Fable 等）----
 // これらは Claude Code が statusline へ渡す JSON には含まれない（rate_limits は five_hour/seven_day のみ）。
 // プラン種別 … 背景フェッチャが GET /api/oauth/profile の organization.rate_limit_tier を書いたキャッシュ。
-//   Keychain の OAuth トークンにも rateLimitTier があるが、**プラン変更に追従しない**ため使わない
-//   （2026-09-05 実測: Max 20x へ変更後にトークンをリフレッシュしても 5x のまま。~/.claude.json も同じ）。
+//   Keychain の OAuth トークンにも rateLimitTier があるが、**ログイン時に焼き付く値**で
+//   そのあとのプラン変更に追従しないため使わない（2026-09-05 実測: Max 20x へ変更後、
+//   リフレッシュしても 5x のまま／再ログインで初めて 20x になる。~/.claude.json も同じ）。
 // モデル別週間制限 … 同じフェッチャが GET /api/oauth/usage の結果を書いたキャッシュから読む。
 const USAGE_CACHE = path.join(os.homedir(), '.claude', 'statusline-usage-cache.json');
 

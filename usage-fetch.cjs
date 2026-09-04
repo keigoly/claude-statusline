@@ -21,7 +21,8 @@
  *
  * 2026-09-05 追加: プラン種別（Max 5x / 20x）は GET /api/oauth/profile の
  *   organization.rate_limit_tier から取る。OAuth トークン内の rateLimitTier は
- *   **プラン変更に追従しない**（20x へ変更後にリフレッシュしても 5x のまま返る）ことを実測した。
+ *   **ログイン時に焼き付く値**で、そのあとのプラン変更に追従しない（20x へ変更後、
+ *   リフレッシュしても 5x のまま。再ログインで初めて 20x になる）ことを実測した。
  *
  * 応答スキーマ（実測・2026-07 / Claude Code v2.1.210）:
  *   { five_hour:{utilization,resets_at}, seven_day:{...},
@@ -343,7 +344,8 @@ async function main() {
   // ④ プラン種別。**OAuth トークン内の rateLimitTier は使わない。**
   //    2026-09-05 実測: Max 20x へ変更したあと、トークンをリフレッシュしても
   //    claudeAiOauth.rateLimitTier は default_claude_max_5x のままで、~/.claude.json の
-  //    organizationRateLimitTier も同じ古い値を写していた。現況を返すのは profile だけ。
+  //    organizationRateLimitTier も同じ古い値を写していた（再ログインで初めて両方 20x になる）。
+  //    リフレッシュ前の時点で現況を返せたのは profile だけ。
   //    プラン変更は稀なので PROFILE_TTL_SEC（既定 1 時間）に 1 回しか叩かない。
   let tier = (prev && prev.tier) || null;
   let tierSource = (prev && prev.tierSource) || null;

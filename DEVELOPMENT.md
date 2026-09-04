@@ -44,13 +44,23 @@ OAuth トークンを読むだけで、リフレッシュは本体に任せる�
 ### プラン種別は OAuth トークンからは取れない
 
 Keychain の `claudeAiOauth.rateLimitTier` と `~/.claude.json` の `organizationRateLimitTier` は、
-どちらも**プラン変更に追従しない**。2026-09-05 に Max 5x → 20x へ変更したあと、トークンを
-リフレッシュさせても（`claude -p` を 1 回走らせると Keychain が書き換わる）両方とも
-`default_claude_max_5x` のままだった。
+どちらも**ログイン時に焼き付く値**で、そのあとのプラン変更には追従しない。2026-09-05 に
+Max 5x → 20x へ変更したあと、次の順で確かめた。
 
-現況を返すのは `GET /api/oauth/profile` の `organization.rate_limit_tier` だけ。ここだけが
-`default_claude_max_20x` を返した。よって**プラン種別は profile から取る**。
+| 操作 | Keychain / `~/.claude.json` の値 |
+| --- | --- |
+| トークンのリフレッシュ（`claude -p` を 1 回走らせると Keychain が書き換わる） | `default_claude_max_5x` のまま |
+| `claude auth logout && claude auth login`（再ログイン） | `default_claude_max_20x` に更新される |
+
+つまりリフレッシュでは直らず、**再ログインするまで古い値が残り続ける**。プランを変えたあと
+何日もログインし直さないのが普通なので、この 2 つは表示の根拠にできない。
+
+現況を返すのは `GET /api/oauth/profile` の `organization.rate_limit_tier` だけで、リフレッシュ前の
+時点で既に `default_claude_max_20x` を返していた。よって**プラン種別は profile から取る**。
 `subscription_status` / `has_extra_usage_enabled` / `seat_tier` も同じ応答に入っている。
+
+`readPlanTier()` の 2 番目の候補（`~/.claude.json` の正規表現抽出）は残してあるが、上の理由で
+初回描画の穴埋め専用であり、金（確定色）では出さない。
 
 プラン変更は稀なので `PROFILE_TTL_SEC`（既定 1 時間）に 1 回しか叩かない。usage の成功に相乗りする
 形で呼ぶので、トークンの状態判定は 1 か所で済む。
