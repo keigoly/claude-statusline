@@ -5,7 +5,9 @@
  *   2) [repo] リポジトリ名 │ [branch] ブランチ [→ 作業中の worktree のブランチ]
  *        主ツリーが既定ブランチ(main)以外 / linked worktree が既定ブランチを保持 なら赤＋警告記号
  *   3) [ctx] コンテキスト使用量バー │ [model] モデル/工数(effort) [→ OpenRouter 外注先 · 配信事業者]
- *   4) [rate] 5h 使用率 ([reset] リセット) │ 7d 使用率 ([reset] リセット) │ OR 残額   ← Pro/Max のみ・初回応答後に出現
+ *   4) [rate] プラン種別 │ 5h 使用率 ([reset] リセット) │ 7d 使用率 ([reset] リセット) │
+ *        モデル別週間枠 [[stale] 経過時間] │ OR/RP/Anlas 残額   ← Pro/Max のみ・初回応答後に出現
+ *        プラン種別とモデル別週間枠は背景取得。古い間は薄く落として経過時間を赤で添える
  *   5) [pr] PR #番号
  *
  * stdin: Claude Code が渡す JSON（https://code.claude.com/docs/en/statusline 準拠）。
@@ -44,10 +46,11 @@ const ICONS = {
     route:  '\u{2192}',  // → (外注経路の矢印。U+2192 は等幅フォントに必ずある字形を選ぶ)
     inflight: '\u{22EF}', // ⋯ (生成中。route と同じく等幅で必ず出る字形に限る)
     warn:   '\u{F071}',  //  (warning triangle。運用違反の印)
+    stale:  '\u{F017}',  //  (clock。背景取得が止まって値が古い印)
   },
   emoji: {
     folder: '📁', repo: '🐙', branch: '🌿', ctx: '🧠', model: '💪', rate: '💰', pr: 'PR', reset: '🔄',
-    route: '→', inflight: '⋯', warn: '⚠',
+    route: '→', inflight: '⋯', warn: '⚠', stale: '🕒',
   },
 };
 const I = ICONS[ICON_SET] || ICONS.nerd;
@@ -65,7 +68,7 @@ const C = {
   orange: '\x1b[38;2;255;106;0m', // アイコン色（#FF6A00）
   gold: '\x1b[38;5;220m',         // プラン種別（Max 20x 等）
   route: '\x1b[38;2;167;139;250m',// 外注先モデル名（外部＝自前のモデル配色と混ざらない藤色）
-  red: '\x1b[38;5;196m',          // 警告（主ツリーの運用違反・NAI 停止）
+  red: '\x1b[38;5;196m',          // 警告（主ツリーの運用違反・Anlas 契約切れ・背景取得の停止）
 };
 const paint = (s, c) => `${c}${s}${C.reset}`;
 const SEP = ` ${C.gray}│${C.reset} `;
@@ -134,6 +137,39 @@ function anlasColor(v) {
        : v < 1000  ? '\x1b[38;5;196m' // 赤
        : v < 2000  ? '\x1b[38;5;226m' // 黄
        :             C.green;
+}
+
+// ---- Anthropic 由来の値の「古さ」----
+//
+// プラン種別とモデル別週間枠（Fable 等）だけは背景フェッチャ経由で、stdin には載らない。
+// つまり取得が壊れると **前回の値がそのまま出続ける**。2026-09-05、Keychain の access token が
+// 期限切れになったあと 30 時間ぶん `Max 5x` と `Fable 16%` が貼り付いたまま、見た目は正常だった。
+// 主ツリーの表示で学んだのと同じ話で、**正しい表示と、異常が伝わる表示は別物**。
+// 古い間は値を薄く落とし、経過時間と理由を添える。
+const STALE_SEC = Number(process.env.STATUSLINE_STALE_SEC) || 1800;
+// 貼り付く（放っておいても直らない）失敗だけ理由を出す。一時的な通信断は経過時間だけでよい。
+const STALE_REASON = {
+  token_expired: 'token 期限切れ',
+  no_token: 'token 無し',
+  http_401: '認証エラー',
+  http_403: '認証エラー',
+  http_429: 'レート制限',
+  schema: '応答形式の変化',
+};
+
+// 最後に Anthropic の取得が成功してからの経過秒。旧形式キャッシュ（anthropic 無し）は
+// fetchedAt が成功時のみ更新される値なのでそのまま使える。判定材料が無ければ null。
+function anthropicAge(cache) {
+  const t = (cache && cache.anthropic && cache.anthropic.lastSuccessAt) || (cache && cache.fetchedAt);
+  return t ? Math.max(0, Math.floor(Date.now() / 1000) - t) : null;
+}
+
+// 経過秒 → "45分" / "30時間" / "3日"（statusline は横幅が命なので 1 単位だけ出す）。
+// 日へ丸めるのは 2 日から。30 時間を「1日前」と出すと実際より軽く見える。
+function fmtAge(sec) {
+  if (sec < 3600) return `${Math.floor(sec / 60)}分`;
+  if (sec < 172800) return `${Math.floor(sec / 3600)}時間`;
+  return `${Math.floor(sec / 86400)}日`;
 }
 
 function abbrevHome(p, home) {
@@ -264,8 +300,10 @@ function fmtDateTime(epoch) {
 
 // ---- プラン使用制限（Max 20x 等）＆ 週間モデル別制限（Fable 等）----
 // これらは Claude Code が statusline へ渡す JSON には含まれない（rate_limits は five_hour/seven_day のみ）。
-// プラン種別 … Keychain 由来キャッシュ or ~/.claude.json の *RateLimitTier から得る。
-// モデル別週間制限 … 背景フェッチャ(usage-fetch.cjs)が GET /api/oauth/usage の結果を書いたキャッシュから読む。
+// プラン種別 … 背景フェッチャが GET /api/oauth/profile の organization.rate_limit_tier を書いたキャッシュ。
+//   Keychain の OAuth トークンにも rateLimitTier があるが、**プラン変更に追従しない**ため使わない
+//   （2026-09-05 実測: Max 20x へ変更後にトークンをリフレッシュしても 5x のまま。~/.claude.json も同じ）。
+// モデル別週間制限 … 同じフェッチャが GET /api/oauth/usage の結果を書いたキャッシュから読む。
 const USAGE_CACHE = path.join(os.homedir(), '.claude', 'statusline-usage-cache.json');
 
 // "default_claude_max_20x" → "Max 20x" 等
@@ -281,9 +319,10 @@ function labelTier(t) {
 }
 
 function readPlanTier(cache) {
-  // 1) キャッシュ（フェッチャが oauth から書いた値）を優先 → ~/.claude.json の巨大 read を避ける
+  // 1) キャッシュ（フェッチャが profile から書いた値）を優先 → ~/.claude.json の巨大 read を避ける
   if (cache && cache.tier) return labelTier(cache.tier);
-  // 2) キャッシュ未生成時のみ ~/.claude.json を正規表現で軽量抽出（全体 JSON.parse はしない）
+  // 2) キャッシュ未生成時のみ ~/.claude.json を正規表現で軽量抽出（全体 JSON.parse はしない）。
+  //    ここは Claude Code が写した値なので古いことがある。初回描画の穴埋め専用。
   try {
     const raw = fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8');
     const m = /"userRateLimitTier"\s*:\s*"([^"]+)"/.exec(raw)
@@ -308,11 +347,23 @@ function maybeRefreshUsage() {
   try { lockAge = now - fs.statSync(lock).mtimeMs; } catch (_) {}
   if (cacheAge <= TTL) return;      // 十分に新しい
   if (lockAge <= LOCK_TTL) return;  // 取得が進行中（とみなす）
-  try { fs.writeFileSync(lock, String(now)); } catch (_) { return; }
+  // 排他は 'wx'（存在したら失敗）で取る。writeFileSync だと statSync との間に隙間があり、
+  // 同じリポジトリを複数のウィンドウが毎秒 3 回描画する環境では、同じ tick で
+  // 全員が「ロック無し」と判定して一斉に spawn する。
+  try { fs.closeSync(fs.openSync(lock, 'wx')); }
+  catch (_) {
+    if (lockAge === Infinity) return;              // 作れず、かつ存在もしない → 書けない場所
+    try { fs.writeFileSync(lock, String(now)); }   // 90 秒超えの残骸は奪ってよい
+    catch (__) { return; }
+  }
   try {
     const { spawn } = require('node:child_process');
     const fetcher = path.join(path.dirname(fs.realpathSync(__filename)), 'usage-fetch.cjs');
-    spawn(process.execPath, [fetcher], { detached: true, stdio: 'ignore' }).unref();
+    const p = spawn(process.execPath, [fetcher], { detached: true, stdio: 'ignore' });
+    // error は次の tick で飛ぶので try/catch では捕まらない。付けないと
+    // 「stdout は出したあとに exit 1 で落ちる」という一番たちの悪い壊れ方をする。
+    p.on('error', () => {});
+    p.unref();
   } catch (_) {}
 }
 
@@ -456,12 +507,16 @@ function fmtUsd(v) {
   return '$' + (n >= 10 ? n.toFixed(1) : n.toFixed(2));
 }
 
-// モデル別週間制限の表示: モデル名は既存のモデル配色（Fable=シルバー等）で、％は使用率カラー
-function renderScoped(b) {
+// モデル別週間制限の表示: モデル名は既存のモデル配色（Fable=シルバー等）で、％は使用率カラー。
+// 古い（背景取得が止まっている）間は sheen も使用率カラーも捨てて薄く落とす。
+// 光っていて色が付いていると「今の値」に見えてしまい、凍結に気づけない。
+function renderScoped(b, stale) {
   if (!b || b.percent == null) return null;
+  const pct = Math.round(b.percent) + '%';
+  if (stale) return `${C.dim}${b.name} ${pct}${C.reset}`;
   const style = isFable(b.name) ? FABLE_STYLE : isOpus(b.name) ? OPUS_STYLE : isSonnet(b.name) ? SONNET_STYLE : null;
   const nm = style ? sheen(b.name, style.base, style.shine) : paint(b.name, C.teal);
-  return `${nm} ${paint(Math.round(b.percent) + '%', barColor(b.percent))}`;
+  return `${nm} ${paint(pct, barColor(b.percent))}`;
 }
 
 function render(data) {
@@ -531,8 +586,17 @@ function render(data) {
   //    5h/7d は stdin(rate_limits) 由来の即時値。プラン種別と Fable 等モデル別枠は背景キャッシュ由来。
   const usage = readUsageCache();
   const seg4 = [];
+  // 5h/7d は stdin 由来なので常に今の値。プラン種別と Fable 等だけが古くなりうる。
+  // 古さを言うのは「取得由来の値を実際に出しているとき」だけ。何も出していない行に
+  // 経過時間だけ置いても読み手には何が古いのか分からない。
+  const age = anthropicAge(usage);
+  const hasFetched = !!(usage && (usage.tier || (Array.isArray(usage.scoped) && usage.scoped.length)));
+  const stale = hasFetched && age != null && age >= STALE_SEC;
+  // キャッシュ未生成時は ~/.claude.json 由来の暫定値になる。あれは Claude Code が写した値で
+  // プラン変更に追従しないため、金（確定色）では出さない。初回の取得が済めば金に変わる。
   const plan = readPlanTier(usage);
-  if (plan) seg4.push(`${C.gold}${plan}${C.reset}`);
+  const planUnverified = !(usage && usage.tier);
+  if (plan) seg4.push((stale || planUnverified) ? `${C.dim}${plan}${C.reset}` : `${C.gold}${plan}${C.reset}`);
   const fh = rl.five_hour, wk = rl.seven_day;
   if (fh && fh.used_percentage != null) {
     let s = `5h ${paint(Math.round(fh.used_percentage) + '%', C.green)}`;
@@ -546,7 +610,12 @@ function render(data) {
   }
   // 週間モデル別制限（Fable 等）: 背景キャッシュから。リセットは 7d と同一のため省略。
   if (usage && Array.isArray(usage.scoped)) {
-    for (const b of usage.scoped) { const s = renderScoped(b); if (s) seg4.push(s); }
+    for (const b of usage.scoped) { const s = renderScoped(b, stale); if (s) seg4.push(s); }
+  }
+  // ここまでが Anthropic 由来。古ければ経過時間を赤で添える（貼り付く失敗だけ理由も出す）。
+  if (stale) {
+    const why = STALE_REASON[usage && usage.anthropic && usage.anthropic.status];
+    seg4.push(`${ic(I.stale)} ${paint(fmtAge(age) + '前', C.red)}${why ? ` ${C.dim}(${why})${C.reset}` : ''}`);
   }
   // OpenRouter 残額（背景キャッシュ由来）。min(クレジット残高, キー期間上限残) = 実際に使い切れる額。
   // 着色は balanceColor（残額の絶対値）。使用率ではなく「あと何ドル使えるか」で危険度が決まるため。
@@ -567,8 +636,8 @@ function render(data) {
   // 契約が切れていると生成そのものが止まるので、その場合は残高より先に赤で出す。
   const nai = usage && usage.novelai;
   if (nai && typeof nai.anlas === 'number') {
-    const label = nai.active === false ? paint('NAI 停止', C.red)
-      : `NAI ${paint(String(nai.anlas), anlasColor(nai.anlas))}`;
+    const label = nai.active === false ? paint('Anlas 契約切れ', C.red)
+      : `Anlas ${paint(String(nai.anlas), anlasColor(nai.anlas))}`;
     seg4.push(label);
   }
   if (seg4.length) lines.push(`${ic(I.rate)} ${seg4.join(SEP)}`);

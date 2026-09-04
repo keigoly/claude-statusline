@@ -35,8 +35,25 @@ statusline へ渡る `rate_limits` は `five_hour` と `seven_day` の 2 つだ�
 モデル別の週間枠は構造上載らない。プラン種別も同様に含まれない。
 
 → 背景フェッチャが Claude Code 自身の使う usage エンドポイントを叩いて補完する。認証は Keychain の
-OAuth トークンを読むだけで、リフレッシュは本体に任せる（期限切れなら次回描画で再取得される）。
-**非公開の経路なので本体更新で壊れうる**が、壊れても fail-open で他の表示は出続ける。
+OAuth トークンを読むだけで、リフレッシュは本体に任せる。**非公開の経路なので本体更新で壊れうる**が、
+壊れても fail-open で他の表示は出続ける。
+
+> 当初ここに「期限切れなら次回描画で再取得される」と書いていたが、**これは誤り**だった。
+> 本体がリフレッシュするまでフェッチャ側は失敗し続ける。実際に 30 時間止まった（後述）。
+
+### プラン種別は OAuth トークンからは取れない
+
+Keychain の `claudeAiOauth.rateLimitTier` と `~/.claude.json` の `organizationRateLimitTier` は、
+どちらも**プラン変更に追従しない**。2026-09-05 に Max 5x → 20x へ変更したあと、トークンを
+リフレッシュさせても（`claude -p` を 1 回走らせると Keychain が書き換わる）両方とも
+`default_claude_max_5x` のままだった。
+
+現況を返すのは `GET /api/oauth/profile` の `organization.rate_limit_tier` だけ。ここだけが
+`default_claude_max_20x` を返した。よって**プラン種別は profile から取る**。
+`subscription_status` / `has_extra_usage_enabled` / `seat_tier` も同じ応答に入っている。
+
+プラン変更は稀なので `PROFILE_TTL_SEC`（既定 1 時間）に 1 回しか叩かない。usage の成功に相乗りする
+形で呼ぶので、トークンの状態判定は 1 か所で済む。
 
 ### 再描画には上限がある
 
@@ -50,6 +67,60 @@ OAuth トークンを読むだけで、リフレッシュは本体に任せる�
 
 最上位の effort 指定は、stdin にも環境変数にも通常の最高値と同じ値でしか現れない。
 
+## Anthropic 側の取得スケジュール (2026-09-05)
+
+### 起きたこと
+
+2026-09-04 00:29 に Keychain の access token が期限切れになり、そこから **30 時間**、
+`Max 5x`（実際は 20x）と `Fable 16%`（実際は 37%）が貼り付いた。見た目は完全に正常だった。
+
+### なぜ止まり続けたか
+
+3 つが噛み合っていた。
+
+1. **期限切れでも叩きに行っていた。** リフレッシュは本体の仕事なので、こちらは失敗するしかない
+2. **`/api/oauth/usage` の 429 は認証より前に返る。** 期限切れトークンでも 401 ではなく
+   429（`retry-after` ≒ 3549）が返る。5 分ごとに叩き続けると窓が延び続け、
+   **トークンが直っても復帰できない**状態に入る
+3. **失敗しても「新鮮なキャッシュ」に見えていた。** bail 経路が OpenRouter / RunPod / Anlas の
+   残額だけを書き戻すため、キャッシュファイルの mtime は 5 分ごとに更新される。statusline 側は
+   mtime しか見ていないので TTL 判定は通り、また 5 分後にフェッチャを起動する — の無限ループ
+
+### どう直したか
+
+キャッシュに `anthropic` ブロック（`lastSuccessAt` / `lastAttemptAt` / `status` /
+`cooldownUntil` / `failures`）を持たせ、Anthropic 側だけ独立にスケジュールする。
+
+| 状態 | 挙動 |
+| --- | --- |
+| `cooldownUntil` が未来 | ネットワークへ出ない |
+| `expiresAt` を過ぎている | **1 回も叩かない**。cooldown も置かない（本体が直した次回で即復帰する） |
+| 429 | `cooldownUntil = now + max(retry-after, 60)` |
+| 401 / 403 | `cooldownUntil = now + 300` |
+| その他・通信断 | 指数バックオフ `60 * 2^(n-1)`、上限 1800 |
+| 200 | `failures` を 0 に戻し `lastSuccessAt` を更新 |
+
+期限切れ判定はローカルのファイル読みだけなので、cooldown を置く必要がない。本体がリフレッシュした
+次の実行でそのまま 200 を取りに行ける。
+
+### 古さを表示に出す (`STALE_SEC`)
+
+最後の成功から `STALE_SEC`（既定 1800 秒）を過ぎたら、**プラン種別とモデル別週間枠を薄く落とし**、
+経過時間を赤で添える。貼り付く種類の失敗（token 期限切れ・認証エラー・レート制限）だけ理由も出す。
+一時的な通信断は経過時間だけでよい。
+
+```
+󰜦 Max 5x │ 5h 40% │ 7d 30% │ Fable 12% │  30時間前 (token 期限切れ) │ OR $12.3
+```
+
+薄く落とすのは「金のプラン種別」と「Fable の sheen」を消すためだ。光ったまま色が付いていると、
+どうしても今の値に見える。**主ツリーの運用違反表示と同じ話で、正しい表示と、異常が伝わる表示は別物。**
+
+5h / 7d は stdin 由来で常に今の値なので、ここでは触らない。
+
+キャッシュ未生成の初回描画だけは `~/.claude.json` 由来の暫定プラン種別が出る。あれも追従しない値なので
+金では出さず薄く落とす。初回の取得が済めば金に変わる。
+
 ## 配色
 
 | 対象 | 色 |
@@ -60,7 +131,9 @@ OAuth トークンを読むだけで、リフレッシュは本体に任せる�
 | 使用率バー・％ | 0-30%=緑 / 31-60%=黄 / 61-90%=赤 / 91%+=紫（`barColor()`） |
 | プラン種別 | 金 |
 | 外注先モデル名 | 藤色 `#A78BFA`。**自前モデルの sheen とは意図的に別系統**にして「外部へ出ている」ことを一目で分かるようにしている |
-| OpenRouter 残額 | `barColor()` と同一規則。残りが減る＝使用率が上がる、と読み替える |
+| OpenRouter / RunPod 残額 | `balanceColor()`。**使用率ではなく残額の絶対値**（$15 / $10 / $5）。上限 $50 の 30% 残と $5 の 30% 残では意味が違うため |
+| Anlas 残高 | `anlasColor()`。USD ではないので `balanceColor()` とは別のしきい値（500 / 1000 / 2000） |
+| 古くなった値 | dim。金や sheen を残すと「今の値」に見えて凍結に気づけない（`STALE_SEC`） |
 
 ## 外注経路の読み取り (`readRoute()`)
 
@@ -97,8 +170,8 @@ Anthropic 側と OpenRouter 側は**独立に取得**する。片方が落ちて
 (実測: 変更前後で差なし)。既定ブランチは `refs/remotes/origin/HEAD` → `main` → `master` の順
 (packed-refs も見る)。判定できなければ従来表示 (fail-open)。
 
-同時に `C.red` を定義した。以前から `NAI 停止` が `C.red` を参照していたが未定義で、`undefined` の文字列が
-そのまま出ていた。
+同時に `C.red` を定義した。以前から `NAI 停止`（現 `Anlas 契約切れ`）が `C.red` を参照していたが未定義で、
+`undefined` の文字列がそのまま出ていた。
 
 ## 変更手順
 
@@ -126,6 +199,28 @@ echo '{"model":{"display_name":"Opus 5"},"workspace":{"current_dir":"/tmp/demo"}
 
 必ず通すパターン: ①外注なし ②窓内に外注あり ③別モデルへの外注 ④窓外（矢印が消える）
 ⑤除外対象の事業者のみ（矢印が出ない）⑥イベントディレクトリ不在 ⑦`openrouter` を含まない旧キャッシュ。
+
+古さ表示は、キャッシュを退避してから `anthropic.lastSuccessAt` を巻き戻して確認する。
+
+```sh
+C=~/.claude/statusline-usage-cache.json; cp "$C" /tmp/cache.bak
+IN='{"workspace":{"current_dir":"/tmp"},"rate_limits":{"five_hour":{"used_percentage":59,"resets_at":0}}}'
+back() { python3 -c "
+import json,os,sys,time
+p=os.path.expanduser('~/.claude/statusline-usage-cache.json'); j=json.load(open(p))
+now=int(time.time())
+j['anthropic']={'lastSuccessAt':now-int(sys.argv[1]),'lastAttemptAt':now,'status':sys.argv[2],'cooldownUntil':None,'failures':0}
+json.dump(j,open(p,'w'))" "$1" "$2"; echo "$IN" | node statusline.cjs | sed 's/\x1b\[[0-9;]*m//g' | sed -n 4p; }
+back 108000 token_expired   # 30時間前 (token 期限切れ)
+back 2700   http_429        # 45分前 (レート制限)
+back 10800  network         # 3時間前（理由は出さない）
+back 1740   ok              # しきい値直下 → 何も出ない
+cp /tmp/cache.bak "$C"
+```
+
+必ず通すパターン: ①正常 ②期限切れ（1 回も叩かない）③トークン無し ④クールダウン中
+⑤429 の `retry-after` 尊重 ⑥連続失敗の指数バックオフと上限 ⑦復旧で `failures` が 0 に戻る
+⑧`anthropic` キーを持たない旧キャッシュ ⑨キャッシュ不在。
 
 主ツリーの運用違反表示は、一時リポジトリで次を通す (色は `sed 's/\x1b\[[0-9;]*m//g'` で除去して構造を見る):
 
