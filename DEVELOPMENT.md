@@ -40,6 +40,8 @@ OAuth トークンを読むだけで、リフレッシュは本体に任せる�
 
 > 当初ここに「期限切れなら次回描画で再取得される」と書いていたが、**これは誤り**だった。
 > 本体がリフレッシュするまでフェッチャ側は失敗し続ける。実際に 30 時間止まった（後述）。
+> さらに「本体が直すのを待てばよい」も誤りで、**対話セッションは Keychain に書き戻さない**
+> （後述「本体は Keychain に書き戻さない」）。
 
 ### プラン種別は OAuth トークンからは取れない
 
@@ -104,14 +106,51 @@ Max 5x → 20x へ変更したあと、次の順で確かめた。
 | 状態 | 挙動 |
 | --- | --- |
 | `cooldownUntil` が未来 | ネットワークへ出ない |
-| `expiresAt` を過ぎている | **1 回も叩かない**。cooldown も置かない（本体が直した次回で即復帰する） |
+| `expiresAt` を過ぎている | **1 回も叩かない**。代わりに `claude -p` を 1 回起動して本体に書き戻させ、同じ実行内で Keychain を読み直す（下記）。cooldown は置かない |
 | 429 | `cooldownUntil = now + max(retry-after, 60)` |
 | 401 / 403 | `cooldownUntil = now + 300` |
 | その他・通信断 | 指数バックオフ `60 * 2^(n-1)`、上限 1800 |
 | 200 | `failures` を 0 に戻し `lastSuccessAt` を更新 |
 
-期限切れ判定はローカルのファイル読みだけなので、cooldown を置く必要がない。本体がリフレッシュした
-次の実行でそのまま 200 を取りに行ける。
+期限切れ判定はローカルのファイル読みだけなので、cooldown を置く必要がない。書き戻しが済んでいれば
+その実行でそのまま 200 を取りに行ける。
+
+### 本体は Keychain に書き戻さない (2026-09-05 追記)
+
+上の表を入れた直後、また止まった。12:24 に access token が失効し、13:07 と 13:08 に対話セッションが
+2 本起動して正常に動いていたのに、Keychain の項目は 04:34 に書かれたまま（`mdat`）だった。
+profile を叩くと 401「OAuth access token has expired」。つまり**対話セッションはリフレッシュした
+トークンをメモリに持つだけで、Keychain には書き戻さない**。前日の 30 時間も同じ構図だった。
+
+何が書き戻すかを本体 2.1.261 で確かめた結果:
+
+| 操作 | Keychain |
+| --- | --- |
+| 対話セッションの起動・API 呼び出し | 書かない |
+| `claude auth status` | 書かない（Keychain を読んで表示するだけ） |
+| `claude --bare ...` | Keychain を**読みもしない**（トリガに使えない） |
+| `claude -p 'ok' --model haiku` | **起動直後・最初の API 呼び出しより前に書く**（debug log: `Keychain payload ... using argv`） |
+| `claude auth login` | 書く（項目を作り直す） |
+
+→ フェッチャは期限切れを見たら `claude -p` を 1 回起動し（`maybeTriggerRefresh()`）、同じ実行内で
+Keychain を読み直して取得へ進む。cwd は一時ディレクトリ（プロジェクトの CLAUDE.md / hook を拾わせない）、
+haiku、`--no-session-persistence --disable-slash-commands --tools ''`。実測 7 秒。
+バイナリは `CLAUDE_CODE_EXECPATH`（statusline を spawn した本体そのもの）→ `~/.local/bin/claude` → PATH。
+
+| 条件 | 挙動 |
+| --- | --- |
+| 前回の起動から `REFRESH_INTERVAL_SEC`（既定 1800）未満 | 起動しない（本体側の不調で 5 分ごとに走らせない） |
+| `refreshTokenExpiresAt` も過ぎている | 起動しない。本体でも直せず再ログインが要る。statusline は「要再ログイン」と出す |
+| `STATUSLINE_CLAUDE_BIN=''` | 機能ごと無効 |
+| 起動後も期限切れ | `refresh.result = still_expired` を残して `token_expired` のまま |
+
+記録は `anthropic.refresh = { at, result, ms }`。result は `refreshed` / `still_expired` /
+`refresh_token_expired` / `no_binary` / `timeout` / `exit_N` / `error` / `disabled`。
+
+**自前でリフレッシュはしない。** 本体は refresh token をローテートし、`~/.claude/.oauth_refresh.lock` と
+compare-and-swap（保存時に Keychain の refresh token が自分の POST した値と一致する時だけ書き、
+違えば相手の値を採用する）で並走セッションを整合させている。ここが別の refresh token を書き込むと
+本体側の照合が崩れ、ログアウトさせうる。`claude -p` なら本体自身の手順に乗る。
 
 ### 古さを表示に出す (`STALE_SEC`)
 
@@ -120,7 +159,7 @@ Max 5x → 20x へ変更したあと、次の順で確かめた。
 一時的な通信断は経過時間だけでよい。
 
 ```
-󰜦 Max 5x │ 5h 40% │ 7d 30% │ Fable 12% │  30時間前 (token 期限切れ) │ OR $12.3
+󰜦 Max 5x │ 5h 40% │ 7d 30% │ Fable 12% │  30時間前 (token 期限切れ・claude -p で復帰) │ OR $12.3
 ```
 
 薄く落とすのは「金のプラン種別」と「Fable の sheen」を消すためだ。光ったまま色が付いていると、
@@ -221,7 +260,7 @@ p=os.path.expanduser('~/.claude/statusline-usage-cache.json'); j=json.load(open(
 now=int(time.time())
 j['anthropic']={'lastSuccessAt':now-int(sys.argv[1]),'lastAttemptAt':now,'status':sys.argv[2],'cooldownUntil':None,'failures':0}
 json.dump(j,open(p,'w'))" "$1" "$2"; echo "$IN" | node statusline.cjs | sed 's/\x1b\[[0-9;]*m//g' | sed -n 4p; }
-back 108000 token_expired   # 30時間前 (token 期限切れ)
+back 108000 token_expired   # 30時間前 (token 期限切れ・claude -p で復帰)
 back 2700   http_429        # 45分前 (レート制限)
 back 10800  network         # 3時間前（理由は出さない）
 back 1740   ok              # しきい値直下 → 何も出ない
@@ -231,6 +270,34 @@ cp /tmp/cache.bak "$C"
 必ず通すパターン: ①正常 ②期限切れ（1 回も叩かない）③トークン無し ④クールダウン中
 ⑤429 の `retry-after` 尊重 ⑥連続失敗の指数バックオフと上限 ⑦復旧で `failures` が 0 に戻る
 ⑧`anthropic` キーを持たない旧キャッシュ ⑨キャッシュ不在。
+
+`claude -p` の起動経路は、本物のトークンに触れないよう**テスト用の Keychain 項目**と偽の `claude` で通す。
+`STATUSLINE_KEYCHAIN_SERVICE` はこのためだけの上書きで、README には載せていない。
+
+```sh
+C=~/.claude/statusline-usage-cache.json; cp "$C" /tmp/cache.bak
+SVC="Claude Code-credentials-sltest"; now=$(( $(date +%s) * 1000 ))
+item() { j=$(printf '{"claudeAiOauth":{"accessToken":"x","refreshToken":"x","expiresAt":%s,"refreshTokenExpiresAt":%s}}' "$1" "$2")
+  security add-generic-password -U -a "$USER" -s "$SVC" -X "$(printf '%s' "$j" | xxd -p | tr -d '\n')"; }
+FAKE=$(mktemp); printf '#!/bin/bash\n[ -n "$FAKE_SLEEP" ] && exec sleep "$FAKE_SLEEP"\necho "$@" >> /tmp/fake-claude.log\nexit ${FAKE_EXIT:-0}\n' > "$FAKE"; chmod +x "$FAKE"
+run() { env STATUSLINE_KEYCHAIN_SERVICE="$SVC" STATUSLINE_CLAUDE_BIN="$FAKE" STATUSLINE_REFRESH_INTERVAL_SEC=1 "$@" node usage-fetch.cjs; sleep 1
+  python3 -c "import json,os;j=json.load(open(os.path.expanduser('$C')));print(j['anthropic']['status'],j['anthropic'].get('refresh'))"; }
+item $((now-3600000)) $((now+86400000)); run                    # token_expired {'result': 'still_expired'}（偽 claude は呼ばれる）
+run STATUSLINE_REFRESH_INTERVAL_SEC=1800                         # 間隔内 → 偽 claude は呼ばれず、記録もそのまま
+run FAKE_EXIT=3                                                  # exit_3
+run FAKE_SLEEP=30 STATUSLINE_REFRESH_TIMEOUT_MS=2000             # timeout
+run STATUSLINE_CLAUDE_BIN=/nonexistent/claude                    # no_binary
+run STATUSLINE_CLAUDE_BIN=                                       # disabled
+item $((now-3600000)) $((now-1000)); run                        # refresh_token_expired（呼ばれない）→ 4 行目に「要再ログイン」
+security delete-generic-password -a "$USER" -s "$SVC"; cp /tmp/cache.bak "$C"
+```
+
+「起動後に本当に復帰する」経路は、偽 `claude` の中で本物の項目をテスト項目へコピーすると通る
+（`security find-generic-password -s "Claude Code-credentials" -w` → hex → `add-generic-password -U`）。
+同じ実行内で `status: ok` になり `refresh.result = refreshed` が残る。
+
+必ず通すパターン: ⑩期限切れ→起動→書き戻し後に同じ実行で取得 ⑪間隔内は再起動しない
+⑫refresh token 切れは起動しない ⑬無効化 ⑭タイムアウト・異常終了・バイナリ不在で落ちない。
 
 主ツリーの運用違反表示は、一時リポジトリで次を通す (色は `sed 's/\x1b\[[0-9;]*m//g'` で除去して構造を見る):
 
