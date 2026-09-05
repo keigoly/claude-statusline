@@ -149,7 +149,7 @@ function anlasColor(v) {
 const STALE_SEC = Number(process.env.STATUSLINE_STALE_SEC) || 1800;
 // 貼り付く（放っておいても直らない）失敗だけ理由を出す。一時的な通信断は経過時間だけでよい。
 const STALE_REASON = {
-  token_expired: 'token 期限切れ',
+  token_expired: 'token 期限切れ・claude -p で復帰',
   no_token: 'token 無し',
   http_401: '認証エラー',
   http_403: '認証エラー',
@@ -615,7 +615,11 @@ function render(data) {
   }
   // ここまでが Anthropic 由来。古ければ経過時間を赤で添える（貼り付く失敗だけ理由も出す）。
   if (stale) {
-    const why = STALE_REASON[usage && usage.anthropic && usage.anthropic.status];
+    const an = usage && usage.anthropic;
+    let why = STALE_REASON[an && an.status];
+    // 期限切れは通常フェッチャが `claude -p` を起動して直す。それでも出ているなら、refresh token
+    // 自体が切れて再ログインが要るか、起動が失敗している。前者は対処が違うので言い分ける。
+    if (an && an.status === 'token_expired' && an.refresh && an.refresh.result === 'refresh_token_expired') why = 'token 期限切れ・要再ログイン';
     seg4.push(`${ic(I.stale)} ${paint(fmtAge(age) + '前', C.red)}${why ? ` ${C.dim}(${why})${C.reset}` : ''}`);
   }
   // OpenRouter 残額（背景キャッシュ由来）。min(クレジット残高, キー期間上限残) = 実際に使い切れる額。

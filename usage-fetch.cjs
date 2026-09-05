@@ -14,6 +14,8 @@
  *   （本体が平文へ退避している環境では ~/.claude/.credentials.json）。
  *   トークンのリフレッシュは Claude Code 本体が行うため、ここでは現在値を読むだけ（リフレッシュ実装なし）。
  *   **期限切れのトークンでは 1 回も叩かない**（後述の cooldown / expiresAt 判定）。
+ *   ただし本体の対話セッションは更新したトークンを Keychain に書き戻さないので、期限切れを見たら
+ *   `claude -p` を 1 回起動して本体に書き戻させる（2026-09-05・後述 maybeTriggerRefresh）。
  *
  * 失敗方針（fail-open）: 認証不可・ネットワーク不通・非200・パース失敗のいずれでも
  *   既存キャッシュを壊さず、ロックだけ解放して静かに終了する。statusline は Fable を出さないだけ。
@@ -34,11 +36,12 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execSync } = require('node:child_process');
+const { execSync, spawnSync } = require('node:child_process');
 
 const CACHE = path.join(os.homedir(), '.claude', 'statusline-usage-cache.json');
 const LOCK = CACHE + '.lock';
-const KEYCHAIN_SERVICE = 'Claude Code-credentials';
+// STATUSLINE_KEYCHAIN_SERVICE はテスト用（本物のトークンに触れずに期限切れ経路を通すため）。
+const KEYCHAIN_SERVICE = process.env.STATUSLINE_KEYCHAIN_SERVICE || 'Claude Code-credentials';
 const CLI_VERSION = process.env.STATUSLINE_CLI_VERSION || '2.1.210';
 
 // プラン種別（/api/oauth/profile）の再取得間隔。プラン変更を察知するのが目的なので
@@ -49,6 +52,11 @@ const TOKEN_SKEW_SEC = 60;
 // 連続失敗時の指数バックオフ（秒）。60 → 120 → 240 … で 30 分頭打ち。
 const BACKOFF_BASE_SEC = 60;
 const BACKOFF_MAX_SEC = 1800;
+// `claude -p` による Keychain 書き戻しを起動する最短間隔（秒）。トークンは 8 時間有効なので
+// 通常は 1 日 3 回で足りる。本体側の不調で書き戻せない時に 5 分ごとに起動し続けないための下限。
+const REFRESH_INTERVAL_SEC = Number(process.env.STATUSLINE_REFRESH_INTERVAL_SEC) || 1800;
+// `claude -p` の待ち時間上限（ms）。実測 7 秒。statusline 側のロック（90 秒）の内側に収める。
+const REFRESH_TIMEOUT_MS = Number(process.env.STATUSLINE_REFRESH_TIMEOUT_MS) || 45000;
 
 function unlock() { try { fs.unlinkSync(LOCK); } catch (_) {} }
 
@@ -229,6 +237,62 @@ function readOAuth() {
   } catch (_) { return null; }
 }
 
+// 期限切れ判定（TOKEN_SKEW_SEC の余裕つき）。expiresAt が無ければ期限不明として有効扱い。
+function tokenExpired(oauth, nowSec) {
+  const expSec = typeof oauth.expiresAt === 'number' ? Math.floor(oauth.expiresAt / 1000) : null;
+  return !!expSec && nowSec >= expSec - TOKEN_SKEW_SEC;
+}
+
+// `claude -p` に使う本体バイナリ。statusline は本体から spawn されるので CLAUDE_CODE_EXECPATH が
+// 「いま動いている本体そのもの」を指す。無ければ通常のインストール先、最後は PATH に任せる。
+// STATUSLINE_CLAUDE_BIN は上書き用（テストで偽物を差す / 空文字で機能ごと無効化）。
+function claudeBinary() {
+  if (process.env.STATUSLINE_CLAUDE_BIN !== undefined) return process.env.STATUSLINE_CLAUDE_BIN || null;
+  for (const c of [process.env.CLAUDE_CODE_EXECPATH, path.join(os.homedir(), '.local', 'bin', 'claude')]) {
+    if (!c) continue;
+    try { fs.accessSync(c, fs.constants.X_OK); return c; } catch (_) {}
+  }
+  return 'claude';
+}
+
+/**
+ * Claude Code 本体に Keychain のトークンを書き戻させる。
+ *
+ * 2026-09-05 実測（本体 2.1.261）: 対話セッションはリフレッシュしたトークンを**メモリに持つだけで
+ * Keychain に書き戻さない**。書き戻すのは `claude -p`（起動直後・最初の API 呼び出しより前）と
+ * ログインだけ。対話セッションしか動いていない限り Keychain は失効したままで、フェッチャは
+ * 「本体が直すのを待つ」だけでは復帰しない（2026-09-04 は 30 時間、09-05 は 1 時間止まった）。
+ *
+ * 自前でリフレッシュはしない。本体は refresh token をローテートし、ロックと compare-and-swap で
+ * 保存している。ここが割り込んで別の refresh token を書くと本体をログアウトさせうる。
+ * `claude -p` なら本体自身の手順（ロック・CAS・並走セッションの追従）に乗る。
+ *
+ * 起動条件: 前回の起動から REFRESH_INTERVAL_SEC 以上。refresh token 自体が切れていれば
+ * 本体でも直せない（再ログインが要る）ので起動しない。
+ * 戻り値: 今回の記録 { at, result, ms? }。起動しなかったなら null。
+ */
+function maybeTriggerRefresh(oauth, prev, nowSec) {
+  if (prev && prev.at && nowSec - prev.at < REFRESH_INTERVAL_SEC) return null;
+  const rec = (result, extra) => Object.assign({ at: nowSec, result }, extra || {});
+  const rtExp = typeof oauth.refreshTokenExpiresAt === 'number' ? Math.floor(oauth.refreshTokenExpiresAt / 1000) : null;
+  if (rtExp && nowSec >= rtExp) return rec('refresh_token_expired');
+  const bin = claudeBinary();
+  if (!bin) return rec('disabled');
+  // cwd は一時ディレクトリ: プロジェクトの CLAUDE.md / hook を拾わせない。
+  // --no-session-persistence でセッションを残さず、--tools '' で 1 往復で終わらせる。
+  const args = ['-p', 'ok', '--model', 'haiku', '--no-session-persistence', '--disable-slash-commands', '--tools', ''];
+  const t0 = Date.now();
+  const r = spawnSync(bin, args, { cwd: os.tmpdir(), stdio: 'ignore', timeout: REFRESH_TIMEOUT_MS });
+  const ms = Date.now() - t0;
+  if (r.error) {
+    if (r.error.code === 'ENOENT') return rec('no_binary', { ms });
+    if (r.error.code === 'ETIMEDOUT') return rec('timeout', { ms });
+    return rec('error', { ms });
+  }
+  if (r.status !== 0) return rec(`exit_${r.status}`, { ms });
+  return rec('ran', { ms });
+}
+
 // ISO8601 文字列 or epoch(秒/ミリ秒・数値でも数値文字列でも) → epoch 秒。
 // 1e12 を境にミリ秒とみなす（2001-09-09 以降の秒 epoch は 1e9 台なので衝突しない）。
 function toEpochSec(v) {
@@ -304,6 +368,8 @@ async function main() {
   // bail 経路が残額だけ書き戻すのでキャッシュの mtime は 5 分ごとに新しくなり、statusline からは
   // 「新鮮なキャッシュ」に見えていた。**古いことが判る状態で止まる**のがここの責務。
   const sched = (prev && prev.anthropic) || {};
+  // `claude -p` を最後に起動した記録。成功・失敗どちらの経路でも引き継ぐ（間隔判定と診断用）。
+  let refresh = sched.refresh || null;
   const finish = (anthropic) => { writeCache(Object.assign(base, { anthropic })); unlock(); };
   // 失敗・見送り時: 最後に成功した時刻は保ったまま、状態だけ更新して終わる。
   const halt = (status, cooldownUntil, failures) => finish({
@@ -312,6 +378,7 @@ async function main() {
     status,
     cooldownUntil: cooldownUntil || null,
     failures: failures == null ? (sched.failures || 0) : failures,
+    refresh,
   });
 
   // ① クールダウン中はネットワークへ出ない
@@ -320,13 +387,23 @@ async function main() {
     return;
   }
 
-  const oauth = readOAuth();
+  let oauth = readOAuth();
   if (!oauth || !oauth.accessToken) { halt('no_token', nowSec + 300, 0); return; }
 
-  // ② 期限切れトークンでは叩かない。リフレッシュは Claude Code 本体の仕事なので、
-  //    本体が直した次の実行でそのまま復帰できるよう cooldown は置かない（判定はローカルで無料）。
-  const expSec = typeof oauth.expiresAt === 'number' ? Math.floor(oauth.expiresAt / 1000) : null;
-  if (expSec && nowSec >= expSec - TOKEN_SKEW_SEC) { halt('token_expired', null, sched.failures || 0); return; }
+  // ② 期限切れトークンでは叩かない（判定はローカルで無料なので cooldown も置かない）。
+  //    ただし待つだけでは復帰しない。本体の対話セッションは Keychain に書き戻さないため、
+  //    `claude -p` を 1 回起動して書き戻させ、同じ実行内で Keychain を読み直す（maybeTriggerRefresh）。
+  if (tokenExpired(oauth, nowSec)) {
+    const r = maybeTriggerRefresh(oauth, refresh, nowSec);
+    if (r) {
+      refresh = r;
+      if (r.result === 'ran') {
+        oauth = readOAuth() || oauth;
+        r.result = tokenExpired(oauth, nowSec) ? 'still_expired' : 'refreshed';
+      }
+    }
+    if (tokenExpired(oauth, nowSec)) { halt('token_expired', null, sched.failures || 0); return; }
+  }
 
   // ③ 使用量
   const usage = await anthropicGet('/api/oauth/usage', oauth.accessToken, nowSec);
@@ -370,7 +447,7 @@ async function main() {
     weekly_all: null,
     scoped: [],
     overage: null,
-    anthropic: { lastSuccessAt: nowSec, lastAttemptAt: nowSec, status: 'ok', cooldownUntil: null, failures: 0 },
+    anthropic: { lastSuccessAt: nowSec, lastAttemptAt: nowSec, status: 'ok', cooldownUntil: null, failures: 0, refresh },
   });
   const limits = Array.isArray(data.limits) ? data.limits : [];
   let parsed = 0;
@@ -401,6 +478,7 @@ async function main() {
       status: 'schema',
       cooldownUntil: nowSec + 300,
       failures: (sched.failures || 0) + 1,
+      refresh,
     };
   }
   if (data.extra_usage && data.extra_usage.is_enabled) {

@@ -27,7 +27,7 @@ Node の単一スクリプトで、依存パッケージはありません。描
 
 ```
 󰜦 Max 20x │ 5h 40% │ 7d 30% │ Fable 22% │ OR $12.3              # 正常
-󰜦 Max 5x  │ 5h 40% │ 7d 30% │ Fable 12% │  30時間前 (token 期限切れ) │ OR $12.3   # 取得が止まっている
+󰜦 Max 5x  │ 5h 40% │ 7d 30% │ Fable 12% │  30時間前 (token 期限切れ・claude -p で復帰) │ OR $12.3   # 取得が止まっている
 ```
 
 プラン種別（Max 5x ⇄ 20x）は既定 1 時間ごとに取り直すので、**プランを切り替えれば自動で追従します**。
@@ -133,6 +133,8 @@ cat ~/.claude/statusline-usage-cache.json
 | `STATUSLINE_USAGE_TTL_SEC` | `300` | 背景フェッチャを再実行する間隔（秒） |
 | `STATUSLINE_PROFILE_TTL_SEC` | `3600` | プラン種別（Max 5x / 20x）を取り直す間隔（秒） |
 | `STATUSLINE_STALE_SEC` | `1800` | この秒数だけ背景取得が成功していなければ「古い」として薄く落とす |
+| `STATUSLINE_CLAUDE_BIN` | 自動検出 | トークン期限切れ時に起動する `claude` のパス。空文字で起動そのものを無効化 |
+| `STATUSLINE_REFRESH_INTERVAL_SEC` | `1800` | `claude -p` を再起動するまでの最短間隔（秒） |
 | `RUNPOD_API_KEY` | 未設定 | RunPod 残額の表示に必要。`STATUSLINE_ENV_FILE` 経由でも可 |
 | `NOVELAI_API_KEY` | 未設定 | Anlas 残高の表示に必要。`STATUSLINE_ENV_FILE` 経由でも可 |
 
@@ -180,7 +182,7 @@ cat ~/.claude/statusline-usage-cache.json
 ## 制約
 
 - **モデル別週間枠とプラン種別は stdin に載りません。** Claude Code が渡す `rate_limits` は `five_hour` / `seven_day` のみです。これらは背景フェッチャが Claude Code 自身の使う**非公開エンドポイント**（`/api/oauth/usage` と `/api/oauth/profile`）から補完しています。**公式にサポートされた経路ではなく、本体の更新で壊れる可能性があります。** 壊れても fail-open で、他の表示は出続けます（値は薄く落ち、経過時間が付きます）。
-- **OAuth トークンのリフレッシュはしません。** Keychain のトークンが期限切れの間は背景取得を丸ごと見送ります（1 回も叩きません）。Claude Code 本体がリフレッシュした次の実行で自動的に復帰します。
+- **OAuth トークンのリフレッシュは自前ではしません。** Keychain のトークンが期限切れの間は背景取得を丸ごと見送ります（1 回も叩きません）。Claude Code の対話セッションは更新したトークンを Keychain に書き戻さないため、期限切れを見つけたら `claude -p 'ok' --model haiku` を 1 回だけ起動して本体に書き戻させます（最短 30 分間隔・haiku への極小の 1 往復。`STATUSLINE_CLAUDE_BIN=''` で無効化）。refresh token まで切れている場合は「要再ログイン」と表示します。
 - **再描画はアイドル約 1fps・アクティブ約 3fps が上限**です（`refreshInterval` は整数秒のみ）。滑らかなアニメーションは構造的に実現できないため、配色は静的グラデーションを採用しています。
 - **truecolor 非対応の端末では色が近似表示**になります。
 
