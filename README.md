@@ -47,7 +47,7 @@ Node の単一スクリプトで、依存パッケージはありません。描
 ## 必要環境
 
 - Node.js 18 以降（グローバルの `fetch` と `AbortSignal.timeout` を使用）
-- macOS（プラン種別・週間枠の取得に Keychain を読むため。**この機能を使わなければ他 OS でも 1〜3 行目と PR 行は動作します**）
+- macOS または Windows。プラン種別・週間枠の取得は Keychain を読みますが、**失敗したら `~/.claude/.credentials.json` に退避されたトークンへフォールバックする**ため、Keychain の無い Windows でも 4 行目まで出ます（実測: Windows 11 / Node 24 / Claude Code ネイティブ版）。Windows では Claude Code が `statusLine` を Git Bash の `sh` で実行するので、Git for Windows が要ります
 - Nerd Font（アイコン表示用。無い場合は `STATUSLINE_ICONS=emoji` で絵文字にフォールバック）
 
 ## インストール
@@ -116,6 +116,42 @@ echo '{"model":{"display_name":"Opus 5"},"effort":{"level":"xhigh"},"workspace":
 STATUSLINE_ENV_FILE=/path/to/your/.env node usage-fetch.cjs
 cat ~/.claude/statusline-usage-cache.json
 ```
+
+### 6.（任意）Orca など `statusLine` を使う IDE と併存させる
+
+[Orca](https://stably.ai/) のような「実 CLI を PTY で動かすエージェント IDE」は、`statusLine` を
+**表示ではなく `rate_limits` の取得口**として使うことがあります。Orca が `~/.claude/settings.json` に
+入れるフックは、stdin の JSON を自分の daemon へ POST するだけで **stdout には何も書きません**。
+
+つまりスロットの奪い合いにはならず、同じ stdin を両方へ配れば共存できます。そのためのラッパーを
+`integrations/orca/statusline-orca.sh` に同梱しています。
+
+```sh
+cp integrations/orca/statusline-orca.sh ~/.claude/statusline-orca.sh
+```
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "sh \"$HOME/.claude/statusline-orca.sh\"",
+    "padding": 0
+  }
+}
+```
+
+ラッパーは `~/.orca/agent-hooks/claude-statusline.{cmd,sh}` があれば先にそれへ stdin を渡し、
+無ければ何もせずに描画へ進みます（fail-open）。`statusline.cjs` の場所は
+`~/.claude/statusline.cjs` → `~/src/claude-statusline/statusline.cjs` の順に探し、
+`STATUSLINE_CJS` / `STATUSLINE_NODE_BIN` で明示もできます。
+
+**ファイル名を変えないでください。** Orca は `statusLine` のコマンド文字列に自分のフック名
+（`claude-statusline.sh` / `.cmd`）が含まれるかで「自分が入れたもの」を判定します。別名にしておけば
+「ユーザー設定」と見なされ、Orca 側から上書きされません。
+
+> Orca 側のフックは Orca の起動時にしか作られません。先にこちらの `statusLine` が入っていると
+> Orca はスロットを譲って**フック自体を作らない**ので、連携を有効にしたい場合は一度
+> `statusLine` を外して Orca を再起動し、フックが生成されてからラッパーに差し替えてください。
 
 ## 設定
 

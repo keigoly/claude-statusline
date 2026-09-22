@@ -314,6 +314,44 @@ r "$D-main"                              # ④ worktree が main → 赤「workt
 r "$D/sub" 2>/dev/null; r /tmp           # ⑤ サブディレクトリでも判定 / git 外は行ごと消える
 ```
 
+## Orca との併存 (2026-09-22)
+
+### 何が起きていたか
+
+Orca (Stably AI・Electron・実 CLI を PTY で動かす) は `~/.claude/settings.json` の `statusLine` を
+**表示ではなく `rate_limits` の取得口**として使う。Orca 1.4.205 のフック
+(`~/.orca/agent-hooks/claude-statusline.{sh,cmd}`) を読むと、やっていることは次の 4 つだけだった。
+
+1. stdin を全部読む。空なら即終了
+2. payload に `"rate_limits"` が含まれなければ即終了
+3. `$ORCA_AGENT_HOOK_ENDPOINT` を読んで daemon の port / token を得る
+4. `curl` で `http://127.0.0.1:$ORCA_AGENT_HOOK_PORT/statusline/claude` へ POST（pane 単位で 15 秒スロットリング）
+
+**stdout には 1 バイトも書かない。** したがってスロットの奪い合いではなく、同じ stdin を両方へ
+配れば両立する。これが `integrations/orca/statusline-orca.sh` の全てである。
+
+### Orca 側の上書き判定
+
+Orca は `statusLine.command` の文字列に自分のフック名 (`claude-statusline.sh` / `.cmd`) が
+含まれるかで `managed` / `user` / `empty` を判定し、**`user` なら一切触らない**。ラッパーを
+`statusline-orca.sh` という別名にしてあるのはこのためで、名前を `claude-statusline.sh` に
+寄せると Orca が自分のものと誤認して上書きしうる。
+
+逆に、こちらの `statusLine` が先に入っていると Orca は**フックスクリプト自体を作らない**。
+Orca 連携を有効にしたい環境では、一度 `statusLine` を外して Orca を**プロセスごと**再起動する
+（ウィンドウを閉じ直すだけでは再インストールが走らない。Orca は常駐する）。フックと
+`claude-statusline.installed` が生成されたのを確認してからラッパーへ戻す。
+
+### Windows での実測 (2026-09-22・Windows 11 / Node 24.12 / Claude Code ネイティブ版)
+
+- **4 行目まで出る。** `readOAuth()` は Keychain (`security`) に失敗したら
+  `~/.claude/.credentials.json` を読むため、Keychain の無い Windows でもプラン種別・5h・週間枠が揃う
+  （`tierSource:"profile"` で `Max 20x` を取得できた）。README の「macOS 必須」は実態より厳しかった
+- **`statusLine` は Git Bash の `sh` で実行される。** Orca が `$OSTYPE` を見る sh スクリプトを
+  生成していることが傍証で、実際に `sh -c "<command>"` 経由で期待どおり描画された。
+  `HOME=/c/Users/<user>`・`OSTYPE=cygwin`・`uname=MINGW64_NT`
+- OpenRouter 連携は `STATUSLINE_EVENTS_DIR` を置いていない環境では当然出ない（仕様どおり）
+
 ## 関連
 
 - stdin スキーマ: https://code.claude.com/docs/en/statusline
