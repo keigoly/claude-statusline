@@ -224,13 +224,16 @@ async function fetchNovelAI() {
  * compare-and-swap で保存しているので、こちらが割り込むとログアウトさせうる。
  */
 function readOAuth() {
-  try {
-    const raw = execSync(`security find-generic-password -s "${KEYCHAIN_SERVICE}" -w`, {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000,
-    }).trim();
-    const o = JSON.parse(raw).claudeAiOauth;
-    if (o && o.accessToken) return o;
-  } catch (_) {}
+  // Keychain は macOS のみ。他 OS で `security` を叩くと cmd.exe が起動してターミナルが開くだけ。
+  if (process.platform === 'darwin') {
+    try {
+      const raw = execSync(`security find-generic-password -s "${KEYCHAIN_SERVICE}" -w`, {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000,
+      }).trim();
+      const o = JSON.parse(raw).claudeAiOauth;
+      if (o && o.accessToken) return o;
+    } catch (_) {}
+  }
   try {
     const raw = fs.readFileSync(path.join(os.homedir(), '.claude', '.credentials.json'), 'utf8');
     return JSON.parse(raw).claudeAiOauth || null;
@@ -282,7 +285,7 @@ function maybeTriggerRefresh(oauth, prev, nowSec) {
   // --no-session-persistence でセッションを残さず、--tools '' で 1 往復で終わらせる。
   const args = ['-p', 'ok', '--model', 'haiku', '--no-session-persistence', '--disable-slash-commands', '--tools', ''];
   const t0 = Date.now();
-  const r = spawnSync(bin, args, { cwd: os.tmpdir(), stdio: 'ignore', timeout: REFRESH_TIMEOUT_MS });
+  const r = spawnSync(bin, args, { cwd: os.tmpdir(), stdio: 'ignore', timeout: REFRESH_TIMEOUT_MS, windowsHide: true });
   const ms = Date.now() - t0;
   if (r.error) {
     if (r.error.code === 'ENOENT') return rec('no_binary', { ms });
