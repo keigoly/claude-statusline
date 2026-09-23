@@ -360,7 +360,8 @@ function maybeRefreshUsage() {
   try {
     const { spawn } = require('node:child_process');
     const fetcher = path.join(path.dirname(fs.realpathSync(__filename)), 'usage-fetch.cjs');
-    const p = spawn(process.execPath, [fetcher], { detached: true, stdio: 'ignore' });
+    // windowsHide: Windows で detached 起動するとコンソールが割り当てられ、ターミナルが開くため。
+    const p = spawn(process.execPath, [fetcher], { detached: true, stdio: 'ignore', windowsHide: true });
     // error は次の tick で飛ぶので try/catch では捕まらない。付けないと
     // 「stdout は出したあとに exit 1 で落ちる」という一番たちの悪い壊れ方をする。
     p.on('error', () => {});
