@@ -180,9 +180,11 @@ async function fetchRunPod() {
  * 「NovelAI の画像 API は 2024 年に廃止された」という記述が各所に残っているが、
  * 実際は移転しただけで、この誤情報の出どころがここ。
  *
- * Anlas は API では `trainingStepsLeft.fixedTrainingStepsLeft` という名前で返る
- * （元は学習ステップ数だった名残）。サブスクの定額なので USD 残高は存在せず、
- * 従量なのはこの Anlas だけ。Opus は月 10,000 付与。
+ * Anlas は API では `trainingStepsLeft` の 2 項目で返る（元は学習ステップ数だった名残）:
+ * 月の付与分 `fixedTrainingStepsLeft`（Opus は月 10,000）と、買い足した分 `purchasedTrainingSteps`。
+ * 使える残高はこの 2 つの合計。サブスクの定額なので USD 残高は存在せず、従量なのはこの Anlas だけ。
+ * 2026-10-03、付与分を使い切って 0 になると、購入分が残っていても付与分だけを見て「Anlas 0」と出ていた。
+ * 合計は描画側で出す（購入分の無い旧キャッシュでも従来どおり描けるように、`anlas` の意味は変えない）。
  *
  * **UA が要る** — DNS/CDN/TLS 終端がすべて Cloudflare のため、既定 UA だと弾かれる。
  * 失敗時は null（呼び出し側が既存キャッシュを保つ）。
@@ -201,10 +203,12 @@ async function fetchNovelAI() {
     });
     if (!r.ok) return null;
     const j = await r.json();
-    const anlas = j && j.trainingStepsLeft && j.trainingStepsLeft.fixedTrainingStepsLeft;
+    const left = j && j.trainingStepsLeft;
+    const anlas = left && left.fixedTrainingStepsLeft;
     if (typeof anlas !== 'number') return null;
     return {
       anlas,
+      purchased: typeof left.purchasedTrainingSteps === 'number' ? left.purchasedTrainingSteps : 0,
       tier: typeof j.tier === 'number' ? j.tier : null,
       active: !!j.active,
       expiresAt: typeof j.expiresAt === 'number' ? j.expiresAt : null,
