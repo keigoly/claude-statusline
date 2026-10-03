@@ -640,10 +640,20 @@ function render(data) {
   // （あちらはドルの絶対額に合わせたしきい値）。Opus の月間付与 10,000 を基準に、
   // 1 か月ぶんの余力がどれだけ残っているかで着色する。
   // 契約が切れていると生成そのものが止まるので、その場合は残高より先に赤で出す。
+  // 残高は月の付与分 (anlas) と購入分 (purchased) の合計。付与分を使い切って購入分（=実費）を
+  // 減らしている間は「(購入分)」を添える（2026-10-03、購入分が残っているのに「Anlas 0」と出ていた）。
+  // purchased の無い旧キャッシュは 0 として扱う＝従来の表示のまま。
   const nai = usage && usage.novelai;
   if (nai && typeof nai.anlas === 'number') {
-    const label = nai.active === false ? paint('Anlas 契約切れ', C.red)
-      : `Anlas ${paint(String(nai.anlas), anlasColor(nai.anlas))}`;
+    const purchased = typeof nai.purchased === 'number' ? nai.purchased : 0;
+    const total = nai.anlas + purchased;
+    let label;
+    if (nai.active === false) {
+      label = paint('Anlas 契約切れ', C.red);
+    } else {
+      label = `Anlas ${paint(String(total), anlasColor(total))}`;
+      if (nai.anlas <= 0 && purchased > 0) label += paint('(購入分)', C.yellow);
+    }
     seg4.push(label);
   }
   if (seg4.length) lines.push(`${ic(I.rate)} ${seg4.join(SEP)}`);

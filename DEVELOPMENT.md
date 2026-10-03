@@ -181,7 +181,7 @@ compare-and-swap（保存時に Keychain の refresh token が自分の POST し
 | プラン種別 | 金 |
 | 外注先モデル名 | 藤色 `#A78BFA`。**自前モデルの sheen とは意図的に別系統**にして「外部へ出ている」ことを一目で分かるようにしている |
 | OpenRouter / RunPod 残額 | `balanceColor()`。**使用率ではなく残額の絶対値**（$15 / $10 / $5）。上限 $50 の 30% 残と $5 の 30% 残では意味が違うため |
-| Anlas 残高 | `anlasColor()`。USD ではないので `balanceColor()` とは別のしきい値（500 / 1000 / 2000） |
+| Anlas 残高 | `anlasColor()`。USD ではないので `balanceColor()` とは別のしきい値（500 / 1000 / 2000）。値は月の付与分 `fixedTrainingStepsLeft` と購入分 `purchasedTrainingSteps` の合計。付与分だけを出していた頃は、付与分を使い切ると購入分が残っていても「Anlas 0」と出た（2026-10-03） |
 | 古くなった値 | dim。金や sheen を残すと「今の値」に見えて凍結に気づけない（`STALE_SEC`） |
 
 ## 外注経路の読み取り (`readRoute()`)
