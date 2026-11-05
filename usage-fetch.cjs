@@ -21,10 +21,13 @@
  *   既存キャッシュを壊さず、ロックだけ解放して静かに終了する。statusline は Fable を出さないだけ。
  *   ただし「静かに終了した」事実は cache.anthropic に残す（statusline が古さを表示に出せるように）。
  *
- * 2026-09-05 追加: プラン種別（Max 5x / 20x）は GET /api/oauth/profile の
+ * 2026-09-05 追加: プラン種別（Max / Ultra 等）は GET /api/oauth/profile の
  *   organization.rate_limit_tier から取る。OAuth トークン内の rateLimitTier は
- *   **ログイン時に焼き付く値**で、そのあとのプラン変更に追従しない（20x へ変更後、
- *   リフレッシュしても 5x のまま。再ログインで初めて 20x になる）ことを実測した。
+ *   **ログイン時に焼き付く値**で、そのあとのプラン変更に追従しない（max_20x へ変更後、
+ *   リフレッシュしても max_5x のまま。再ログインで初めて max_20x になる）ことを実測した。
+ * 2026-11-06 追加: 2026-10-30 に Max 5x は Max、Max 20x は Ultra へ改称された。rate_limit_tier は
+ *   default_claude_max_5x / _20x のまま変わらず、名前だけが変わった。表示名は同じ応答の
+ *   organization.plan_display_name を planName へ写す（tier は識別子のまま残す）。
  *
  * 応答スキーマ（実測・2026-07 / Claude Code v2.1.210）:
  *   { five_hour:{utilization,resets_at}, seven_day:{...},
@@ -310,6 +313,14 @@ function toEpochSec(v) {
   return Number.isFinite(t) ? Math.floor(t / 1000) : null;
 }
 
+// profile の plan_display_name（"Ultra" 等）→ キャッシュの planName。statusline がそのまま端末へ
+// 出すので、制御文字（ANSI のエスケープを含む）を落とす。文字列でない・空なら null。
+function cleanPlanName(v) {
+  if (typeof v !== 'string') return null;
+  const s = v.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim();
+  return s || null;
+}
+
 // Retry-After は「秒数」か「HTTP-date」のどちらかで来る。両方を秒へ寄せる。
 function parseRetryAfter(v, nowSec) {
   if (!v) return 0;
@@ -426,19 +437,27 @@ async function main() {
   const data = usage.json || {};
 
   // ④ プラン種別。**OAuth トークン内の rateLimitTier は使わない。**
-  //    2026-09-05 実測: Max 20x へ変更したあと、トークンをリフレッシュしても
+  //    2026-09-05 実測: 上位プラン（当時の Max 20x・現 Ultra）へ変更したあと、トークンをリフレッシュしても
   //    claudeAiOauth.rateLimitTier は default_claude_max_5x のままで、~/.claude.json の
-  //    organizationRateLimitTier も同じ古い値を写していた（再ログインで初めて両方 20x になる）。
+  //    organizationRateLimitTier も同じ古い値を写していた（再ログインで初めて両方 max_20x になる）。
   //    リフレッシュ前の時点で現況を返せたのは profile だけ。
   //    プラン変更は稀なので PROFILE_TTL_SEC（既定 1 時間）に 1 回しか叩かない。
+  //    表示名は同じ応答の plan_display_name を planName に写す。2026-10-30 の改称（Max 5x → Max、
+  //    Max 20x → Ultra）では rate_limit_tier は変わらず名前だけが変わったので、名前は先方が返すものを
+  //    使う。tier は他のツールが識別子として読むので、名前に置き換えず別の項目にする。
+  //    planName のキーが無い（この版より前の）キャッシュは、TTL を待たずに 1 回だけ取り直す。
   let tier = (prev && prev.tier) || null;
   let tierSource = (prev && prev.tierSource) || null;
   let tierFetchedAt = (prev && prev.tierFetchedAt) || null;
-  if (tierSource !== 'profile' || !tierFetchedAt || nowSec - tierFetchedAt >= PROFILE_TTL_SEC) {
+  let planName = prev ? prev.planName : undefined;
+  if (tierSource !== 'profile' || !tierFetchedAt || nowSec - tierFetchedAt >= PROFILE_TTL_SEC || planName === undefined) {
     const prof = await anthropicGet('/api/oauth/profile', oauth.accessToken, nowSec);
     const org = prof.ok && prof.json && prof.json.organization;
     const t = org && org.rate_limit_tier;
-    if (typeof t === 'string' && t) { tier = t; tierSource = 'profile'; tierFetchedAt = nowSec; }
+    if (typeof t === 'string' && t) {
+      tier = t; tierSource = 'profile'; tierFetchedAt = nowSec;
+      planName = cleanPlanName(org.plan_display_name);
+    }
   }
   // profile が一度も取れていない時だけ、トークン側の値で穴を埋める（古い可能性がある値）。
   if (!tier && oauth.rateLimitTier) { tier = oauth.rateLimitTier; tierSource = 'oauth'; tierFetchedAt = nowSec; }
@@ -449,6 +468,9 @@ async function main() {
     tier,
     tierSource,
     tierFetchedAt,
+    // 表示名。null は「profile は取れたが表示名が無かった」（statusline は tier から名前を作る）。
+    // undefined のまま（profile がまだ取れていない）ならキーごと書かれず、次の実行で取り直す。
+    planName,
     subscriptionType: oauth.subscriptionType || null,
     session: null,
     weekly_all: null,

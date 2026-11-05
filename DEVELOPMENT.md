@@ -47,7 +47,7 @@ OAuth トークンを読むだけで、リフレッシュは本体に任せる�
 
 Keychain の `claudeAiOauth.rateLimitTier` と `~/.claude.json` の `organizationRateLimitTier` は、
 どちらも**ログイン時に焼き付く値**で、そのあとのプラン変更には追従しない。2026-09-05 に
-Max 5x → 20x へ変更したあと、次の順で確かめた。
+Max 5x → Max 20x（当時の名前。今の Max → Ultra）へ変更したあと、次の順で確かめた。
 
 | 操作 | Keychain / `~/.claude.json` の値 |
 | --- | --- |
@@ -67,6 +67,41 @@ Max 5x → 20x へ変更したあと、次の順で確かめた。
 プラン変更は稀なので `PROFILE_TTL_SEC`（既定 1 時間）に 1 回しか叩かない。usage の成功に相乗りする
 形で呼ぶので、トークンの状態判定は 1 か所で済む。
 
+### プラン名は Anthropic の表示名を使う (2026-11-06)
+
+2026-10-30 に Anthropic がプランを改称した。値段は変わっていない。
+
+| 旧名 | 今の名前 | 月額 | 枠 |
+| --- | --- | --- | --- |
+| Max 5x | **Max** | $100 | Pro の 5 倍（5 時間枠と週の枠） |
+| Max 20x | **Ultra** | $200 | 週は Pro の 10 倍。**検証済みのアカウントには 5 時間枠が無い**（未検証の間は一時的な枠がある）。Fable には別の週の枠がある |
+
+改称のあとで profile を叩くと、**識別子は変わらず、名前だけが増えていた**。
+
+| 項目 | 値 |
+| --- | --- |
+| `organization.rate_limit_tier` | `default_claude_max_20x`（改称前と同じ） |
+| `organization.plan_display_name` | `Ultra`（新しい項目） |
+| `organization.plan_display_label` | `Ultra plan`（新しい項目） |
+| `~/.claude.json` の `oauthAccount.planDisplayName` | `Ultra` |
+
+それまで表示名は `labelTier()` が `max_20x` から `Max 20x` を作っていたので、改称に気づかないまま古い名前を
+出し続けた。そこで名前は先方が返すものを使う。
+
+- フェッチャが `plan_display_name` をキャッシュの **`planName`**（新しい項目）へ写す。`tier` は他のツールが
+  識別子として読む前提なので、名前で上書きせず識別子のまま残す
+- statusline は `planName` → `labelTier(tier)`（`max_20x` → `Ultra`、`max_5x` → `Max`）の順に使う。
+  キャッシュ未生成の初回描画は `~/.claude.json` の `planDisplayName` → tier の順（薄く出す）
+- `planName` の値の意味: 文字列 = 表示名 / `null` = profile は取れたが表示名が無かった /
+  **キー無し = この版のフェッチャがまだ profile を取れていない**。キー無しのときは `PROFILE_TTL_SEC` を待たずに
+  1 回だけ取り直す（更新した直後から新しい名前が出るように）
+- 表示名はそのまま端末へ出すので、写すときに制御文字を落とす
+
+**5 時間枠の無いプランでは 5h が出ない。** 検証済みの Ultra では usage の `limits[]` に `kind:"session"` が無く、
+キャッシュの `session` は `null` になる。Claude Code も API が 5 時間枠を報告している間だけ stdin に `five_hour` を
+載せるので、4 行目はプラン種別の次が 7d になる。キャッシュを読む側で `session` を必須にしていると、
+検証済みの Ultra では常に欠測になる。
+
 ### 再描画には上限がある
 
 アイドル時は約 1fps（`refreshInterval` は整数秒のみで小数不可）、アクティブ時も約 3fps
@@ -84,7 +119,7 @@ Max 5x → 20x へ変更したあと、次の順で確かめた。
 ### 起きたこと
 
 2026-09-04 00:29 に Keychain の access token が期限切れになり、そこから **30 時間**、
-`Max 5x`（実際は 20x）と `Fable 16%`（実際は 37%）が貼り付いた。見た目は完全に正常だった。
+`Max 5x`（実際は 20x。名前はいずれも改称前のもの）と `Fable 16%`（実際は 37%）が貼り付いた。見た目は完全に正常だった。
 
 ### なぜ止まり続けたか
 
@@ -159,7 +194,7 @@ compare-and-swap（保存時に Keychain の refresh token が自分の POST し
 一時的な通信断は経過時間だけでよい。
 
 ```
-󰜦 Max 5x │ 5h 40% │ 7d 30% │ Fable 12% │  30時間前 (token 期限切れ・claude -p で復帰) │ OR $12.3
+󰜦 Max │ 5h 40% │ 7d 30% │ Fable 12% │  30時間前 (token 期限切れ・claude -p で復帰) │ OR $12.3
 ```
 
 薄く落とすのは「金のプラン種別」と「Fable の sheen」を消すためだ。光ったまま色が付いていると、
@@ -299,6 +334,37 @@ security delete-generic-password -a "$USER" -s "$SVC"; cp /tmp/cache.bak "$C"
 必ず通すパターン: ⑩期限切れ→起動→書き戻し後に同じ実行で取得 ⑪間隔内は再起動しない
 ⑫refresh token 切れは起動しない ⑬無効化 ⑭タイムアウト・異常終了・バイナリ不在で落ちない。
 
+プラン名（`planName`）は、profile の応答を変えて通す。ネットワークへ出さずに済むよう、`fetch` を差し替える
+preload を `node --require` で読ませ、HOME を一時ディレクトリへ向けて偽のトークンを置く
+（Keychain は `STATUSLINE_KEYCHAIN_SERVICE` を存在しない名前にして外す）。実キャッシュにも触れない。
+
+```sh
+F=/tmp/fake-fetch.cjs
+cat > "$F" <<'EOF'
+globalThis.fetch = async (url) => {
+  const p = new URL(String(url)).pathname;
+  const ok = (b) => new Response(JSON.stringify(b), { status: 200 });
+  if (p === '/api/oauth/usage') return ok({ limits: [{ kind: 'weekly_all', percent: 17, resets_at: null, is_active: true }] });
+  if (p === '/api/oauth/profile') return ok({ organization: { rate_limit_tier: 'default_claude_max_20x', plan_display_name: 'Ultra' } });
+  return new Response('', { status: 404 });
+};
+EOF
+H=$(mktemp -d); mkdir -p "$H/.claude"
+printf '{"claudeAiOauth":{"accessToken":"x","expiresAt":%s}}' $(( ($(date +%s) + 3600) * 1000 )) > "$H/.claude/.credentials.json"
+env -u STATUSLINE_ENV_FILE HOME="$H" STATUSLINE_KEYCHAIN_SERVICE=none STATUSLINE_CLAUDE_BIN= node --require "$F" usage-fetch.cjs
+python3 -c "import json,sys;j=json.load(open(sys.argv[1]));print(j['tier'], j.get('planName'))" "$H/.claude/statusline-usage-cache.json"
+# → default_claude_max_20x Ultra
+echo '{"workspace":{"current_dir":"/tmp"},"rate_limits":{"seven_day":{"used_percentage":17,"resets_at":0}}}' \
+  | env -u STATUSLINE_EVENTS_DIR HOME="$H" node statusline.cjs | sed 's/\x1b\[[0-9;]*m//g' | tail -1
+# → 󰜦 Ultra │ 7d 17%
+rm -rf "$H" "$F"
+```
+
+必ず通すパターン: ⑮表示名あり（`planName` の名前が出る）⑯表示名なし（`planName: null` → tier から
+`Ultra` / `Max`）⑰`planName` を持たない旧キャッシュ（TTL 内でも 1 回だけ profile を取り直し、次の実行では叩かない）
+⑱profile の失敗（キー無しのまま・`tier` は前回値・次の実行で取り直す）⑲制御文字が落ちる
+⑳キャッシュ無し（`~/.claude.json` の `planDisplayName` を薄く出す）。どの場合も `tier` は識別子のまま変わらないこと。
+
 主ツリーの運用違反表示は、一時リポジトリで次を通す (色は `sed 's/\x1b\[[0-9;]*m//g'` で除去して構造を見る):
 
 ```sh
@@ -346,7 +412,7 @@ Orca 連携を有効にしたい環境では、一度 `statusLine` を外して 
 
 - **4 行目まで出る。** `readOAuth()` は Keychain (`security`) に失敗したら
   `~/.claude/.credentials.json` を読むため、Keychain の無い Windows でもプラン種別・5h・週間枠が揃う
-  （`tierSource:"profile"` で `Max 20x` を取得できた）。README の「macOS 必須」は実態より厳しかった
+  （`tierSource:"profile"` で `default_claude_max_20x` を取得できた）。README の「macOS 必須」は実態より厳しかった
 - **`statusLine` は Git Bash の `sh` で実行される。** Orca が `$OSTYPE` を見る sh スクリプトを
   生成していることが傍証で、実際に `sh -c "<command>"` 経由で期待どおり描画された。
   `HOME=/c/Users/<user>`・`OSTYPE=cygwin`・`uname=MINGW64_NT`

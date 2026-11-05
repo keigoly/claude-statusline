@@ -6,7 +6,8 @@
  *        主ツリーが既定ブランチ(main)以外 / linked worktree が既定ブランチを保持 なら赤＋警告記号
  *   3) [ctx] コンテキスト使用量バー │ [model] モデル/工数(effort) [→ OpenRouter 外注先 · 配信事業者]
  *   4) [rate] プラン種別 │ 5h 使用率 ([reset] リセット) │ 7d 使用率 ([reset] リセット) │
- *        モデル別週間枠 [[stale] 経過時間] │ OR/RP/Anlas 残額   ← Pro/Max のみ・初回応答後に出現
+ *        モデル別週間枠 [[stale] 経過時間] │ OR/RP/Anlas 残額   ← Pro/Max/Ultra のみ・初回応答後に出現
+ *        5h は 5 時間枠のあるプランだけ（検証済みの Ultra には無い）
  *        プラン種別とモデル別週間枠は背景取得。古い間は薄く落として経過時間を赤で添える
  *   5) [pr] PR #番号
  *
@@ -66,7 +67,7 @@ const C = {
   yellow: '\x1b[38;5;221m',       // PR番号
   gray: '\x1b[38;5;245m',         // 区切り・リセット時刻・モデル/工数区切り
   orange: '\x1b[38;2;255;106;0m', // アイコン色（#FF6A00）
-  gold: '\x1b[38;5;220m',         // プラン種別（Max 20x 等）
+  gold: '\x1b[38;5;220m',         // プラン種別（Ultra 等）
   route: '\x1b[38;2;167;139;250m',// 外注先モデル名（外部＝自前のモデル配色と混ざらない藤色）
   red: '\x1b[38;5;196m',          // 警告（主ツリーの運用違反・Anlas 契約切れ・背景取得の停止）
 };
@@ -143,7 +144,7 @@ function anlasColor(v) {
 //
 // プラン種別とモデル別週間枠（Fable 等）だけは背景フェッチャ経由で、stdin には載らない。
 // つまり取得が壊れると **前回の値がそのまま出続ける**。2026-09-05、Keychain の access token が
-// 期限切れになったあと 30 時間ぶん `Max 5x` と `Fable 16%` が貼り付いたまま、見た目は正常だった。
+// 期限切れになったあと 30 時間ぶん、変更前のプラン種別と `Fable 16%` が貼り付いたまま、見た目は正常だった。
 // 主ツリーの表示で学んだのと同じ話で、**正しい表示と、異常が伝わる表示は別物**。
 // 古い間は値を薄く落とし、経過時間と理由を添える。
 const STALE_SEC = Number(process.env.STATUSLINE_STALE_SEC) || 1800;
@@ -298,20 +299,23 @@ function fmtDateTime(epoch) {
   return `${d.getMonth() + 1}/${d.getDate()} ${fmtTime(epoch)}`;
 }
 
-// ---- プラン使用制限（Max 20x 等）＆ 週間モデル別制限（Fable 等）----
+// ---- プラン使用制限（Ultra 等）＆ 週間モデル別制限（Fable 等）----
 // これらは Claude Code が statusline へ渡す JSON には含まれない（rate_limits は five_hour/seven_day のみ）。
-// プラン種別 … 背景フェッチャが GET /api/oauth/profile の organization.rate_limit_tier を書いたキャッシュ。
+// プラン種別 … 背景フェッチャが GET /api/oauth/profile の organization.plan_display_name（表示名 →
+//   planName）と rate_limit_tier（識別子 → tier）を書いたキャッシュ。
 //   Keychain の OAuth トークンにも rateLimitTier があるが、**ログイン時に焼き付く値**で
-//   そのあとのプラン変更に追従しないため使わない（2026-09-05 実測: Max 20x へ変更後、
-//   リフレッシュしても 5x のまま／再ログインで初めて 20x になる。~/.claude.json も同じ）。
+//   そのあとのプラン変更に追従しないため使わない（2026-09-05 実測: 上位プラン（当時の Max 20x・現 Ultra）へ
+//   変更後、リフレッシュしても max_5x のまま／再ログインで初めて max_20x になる。~/.claude.json も同じ）。
 // モデル別週間制限 … 同じフェッチャが GET /api/oauth/usage の結果を書いたキャッシュから読む。
 const USAGE_CACHE = path.join(os.homedir(), '.claude', 'statusline-usage-cache.json');
 
-// "default_claude_max_20x" → "Max 20x" 等
+// "default_claude_max_20x" → "Ultra" / "default_claude_max_5x" → "Max" 等。
+// 2026-10-30 に Max 5x は Max、Max 20x は Ultra へ改称された。識別子のほうは改称後も
+// max_5x / max_20x のまま（2026-11-06 に profile で実測）なので、ここで今の名前へ読み替える。
 function labelTier(t) {
   if (!t) return null;
-  const mx = /max[_-]?(\d+)x/i.exec(t);
-  if (mx) return `Max ${mx[1]}x`;
+  if (/max[_-]?20x/i.test(t)) return 'Ultra';
+  if (/max[_-]?5x/i.test(t)) return 'Max';
   if (/team/i.test(t)) return 'Team';
   if (/max/i.test(t)) return 'Max';
   if (/pro/i.test(t)) return 'Pro';
@@ -320,12 +324,19 @@ function labelTier(t) {
 }
 
 function readPlanTier(cache) {
-  // 1) キャッシュ（フェッチャが profile から書いた値）を優先 → ~/.claude.json の巨大 read を避ける
+  // 1) キャッシュ（フェッチャが profile から書いた値）を優先 → ~/.claude.json の巨大 read を避ける。
+  //    表示名（planName = profile の plan_display_name）を第一に使う。先方が返す名前なので、
+  //    改称にコードの変更なしで追従する。無い（旧キャッシュ・表示名を返さない応答）ときだけ
+  //    tier を labelTier() の対応表で名前にする。
+  if (cache && cache.planName) return cache.planName;
   if (cache && cache.tier) return labelTier(cache.tier);
   // 2) キャッシュ未生成時のみ ~/.claude.json を正規表現で軽量抽出（全体 JSON.parse はしない）。
   //    ここは Claude Code が写した値なので古いことがある。初回描画の穴埋め専用。
+  //    表示名（planDisplayName）があればそれを、無ければ tier を名前にする（1 と同じ順）。
   try {
     const raw = fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8');
+    const d = /"planDisplayName"\s*:\s*"([^"]+)"/.exec(raw);
+    if (d) return d[1];
     const m = /"userRateLimitTier"\s*:\s*"([^"]+)"/.exec(raw)
            || /"organizationRateLimitTier"\s*:\s*"([^"]+)"/.exec(raw);
     return m ? labelTier(m[1]) : null;
@@ -584,7 +595,7 @@ function render(data) {
   }
   lines.push(seg3.join(SEP));
 
-  // 4) プラン種別 & レート制限（Max 20x │ 5h │ 7d │ Fable…）
+  // 4) プラン種別 & レート制限（Max │ 5h │ 7d │ Fable…）
   //    5h/7d は stdin(rate_limits) 由来の即時値。プラン種別と Fable 等モデル別枠は背景キャッシュ由来。
   const usage = readUsageCache();
   const seg4 = [];
@@ -599,6 +610,8 @@ function render(data) {
   const plan = readPlanTier(usage);
   const planUnverified = !(usage && usage.tier);
   if (plan) seg4.push((stale || planUnverified) ? `${C.dim}${plan}${C.reset}` : `${C.gold}${plan}${C.reset}`);
+  // 5h は stdin に five_hour があるときだけ出す。Claude Code は API が 5 時間枠を報告している間だけ
+  // five_hour を載せる仕様で、2026-10-30 以降、検証済みの Ultra には 5 時間枠そのものが無い。
   const fh = rl.five_hour, wk = rl.seven_day;
   if (fh && fh.used_percentage != null) {
     let s = `5h ${paint(Math.round(fh.used_percentage) + '%', C.green)}`;
