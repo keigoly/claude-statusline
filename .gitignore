@@ -6,3 +6,5 @@ statusline-usage-cache.json
 statusline-usage-cache.json.lock
 # 公開前の開発履歴の退避先（ローカル専用）
 .archive/
+# 手元だけの AI への指示（公開しない）
+CLAUDE.local.md
