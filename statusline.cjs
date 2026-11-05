@@ -307,11 +307,13 @@ function fmtDateTime(epoch) {
 // モデル別週間制限 … 同じフェッチャが GET /api/oauth/usage の結果を書いたキャッシュから読む。
 const USAGE_CACHE = path.join(os.homedir(), '.claude', 'statusline-usage-cache.json');
 
-// "default_claude_max_20x" → "Max 20x" 等
+// "default_claude_max_20x" → "Ultra" / "default_claude_max_5x" → "Max" 等。
+// 2026-10-30 に Max 5x は Max、Max 20x は Ultra へ改称された。識別子のほうは改称後も
+// max_5x / max_20x のまま（2026-11-06 に profile で実測）なので、ここで今の名前へ読み替える。
 function labelTier(t) {
   if (!t) return null;
-  const mx = /max[_-]?(\d+)x/i.exec(t);
-  if (mx) return `Max ${mx[1]}x`;
+  if (/max[_-]?20x/i.test(t)) return 'Ultra';
+  if (/max[_-]?5x/i.test(t)) return 'Max';
   if (/team/i.test(t)) return 'Team';
   if (/max/i.test(t)) return 'Max';
   if (/pro/i.test(t)) return 'Pro';
