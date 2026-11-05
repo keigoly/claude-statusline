@@ -21,10 +21,13 @@
  *   既存キャッシュを壊さず、ロックだけ解放して静かに終了する。statusline は Fable を出さないだけ。
  *   ただし「静かに終了した」事実は cache.anthropic に残す（statusline が古さを表示に出せるように）。
  *
- * 2026-09-05 追加: プラン種別（Max 5x / 20x）は GET /api/oauth/profile の
+ * 2026-09-05 追加: プラン種別（Max / Ultra 等）は GET /api/oauth/profile の
  *   organization.rate_limit_tier から取る。OAuth トークン内の rateLimitTier は
- *   **ログイン時に焼き付く値**で、そのあとのプラン変更に追従しない（20x へ変更後、
- *   リフレッシュしても 5x のまま。再ログインで初めて 20x になる）ことを実測した。
+ *   **ログイン時に焼き付く値**で、そのあとのプラン変更に追従しない（max_20x へ変更後、
+ *   リフレッシュしても max_5x のまま。再ログインで初めて max_20x になる）ことを実測した。
+ * 2026-11-06 追加: 2026-10-30 に Max 5x は Max、Max 20x は Ultra へ改称された。rate_limit_tier は
+ *   default_claude_max_5x / _20x のまま変わらず、名前だけが変わった。表示名は同じ応答の
+ *   organization.plan_display_name を planName へ写す（tier は識別子のまま残す）。
  *
  * 応答スキーマ（実測・2026-07 / Claude Code v2.1.210）:
  *   { five_hour:{utilization,resets_at}, seven_day:{...},
@@ -434,9 +437,9 @@ async function main() {
   const data = usage.json || {};
 
   // ④ プラン種別。**OAuth トークン内の rateLimitTier は使わない。**
-  //    2026-09-05 実測: Max 20x へ変更したあと、トークンをリフレッシュしても
+  //    2026-09-05 実測: 上位プラン（当時の Max 20x・現 Ultra）へ変更したあと、トークンをリフレッシュしても
   //    claudeAiOauth.rateLimitTier は default_claude_max_5x のままで、~/.claude.json の
-  //    organizationRateLimitTier も同じ古い値を写していた（再ログインで初めて両方 20x になる）。
+  //    organizationRateLimitTier も同じ古い値を写していた（再ログインで初めて両方 max_20x になる）。
   //    リフレッシュ前の時点で現況を返せたのは profile だけ。
   //    プラン変更は稀なので PROFILE_TTL_SEC（既定 1 時間）に 1 回しか叩かない。
   //    表示名は同じ応答の plan_display_name を planName に写す。2026-10-30 の改称（Max 5x → Max、
