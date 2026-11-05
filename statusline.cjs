@@ -322,12 +322,19 @@ function labelTier(t) {
 }
 
 function readPlanTier(cache) {
-  // 1) キャッシュ（フェッチャが profile から書いた値）を優先 → ~/.claude.json の巨大 read を避ける
+  // 1) キャッシュ（フェッチャが profile から書いた値）を優先 → ~/.claude.json の巨大 read を避ける。
+  //    表示名（planName = profile の plan_display_name）を第一に使う。先方が返す名前なので、
+  //    改称にコードの変更なしで追従する。無い（旧キャッシュ・表示名を返さない応答）ときだけ
+  //    tier を labelTier() の対応表で名前にする。
+  if (cache && cache.planName) return cache.planName;
   if (cache && cache.tier) return labelTier(cache.tier);
   // 2) キャッシュ未生成時のみ ~/.claude.json を正規表現で軽量抽出（全体 JSON.parse はしない）。
   //    ここは Claude Code が写した値なので古いことがある。初回描画の穴埋め専用。
+  //    表示名（planDisplayName）があればそれを、無ければ tier を名前にする（1 と同じ順）。
   try {
     const raw = fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8');
+    const d = /"planDisplayName"\s*:\s*"([^"]+)"/.exec(raw);
+    if (d) return d[1];
     const m = /"userRateLimitTier"\s*:\s*"([^"]+)"/.exec(raw)
            || /"organizationRateLimitTier"\s*:\s*"([^"]+)"/.exec(raw);
     return m ? labelTier(m[1]) : null;
