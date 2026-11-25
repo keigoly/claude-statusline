@@ -4,7 +4,7 @@
  *   1) [folder] カレントフォルダ（~ 省略）
  *   2) [repo] リポジトリ名 │ [branch] ブランチ [→ 作業中の worktree のブランチ]
  *        主ツリーが既定ブランチ(main)以外 / linked worktree が既定ブランチを保持 なら赤＋警告記号
- *   3) [ctx] コンテキスト使用量バー │ [model] モデル/工数(effort) [→ OpenRouter 外注先 · 配信事業者]
+ *   3) [ctx] コンテキスト使用量バー │ [model] モデル/工数(effort) [→ このセッションの外注先 · 配信事業者]
  *   4) [rate] プラン種別 │ 5h 使用率 ([reset] リセット) │ 7d 使用率 ([reset] リセット) │
  *        モデル別週間枠 [[stale] 経過時間] │ OR/RP/Anlas 残額   ← Pro/Max/Ultra のみ・初回応答後に出現
  *        5h は 5 時間枠のあるプランだけ（検証済みの Ultra には無い）
@@ -386,7 +386,8 @@ function maybeRefreshUsage() {
 //
 // 期待する 1 行の形（余分なキーは無視される）:
 //   {"timestamp":"<ISO8601>","payload":{"backend":"openrouter",
-//     "model":"<provider/slug>","provider":"<配信事業者名>"}}
+//     "model":"<provider/slug>","provider":"<配信事業者名>",
+//     "claude_session_id":"<呼び出し元の session_id>"}}   ← 任意（isOwnRoute() を参照）
 // ファイル名は JST 日付で `events_YYYY-MM-DD.jsonl`。
 //
 // STATUSLINE_EVENTS_DIR が未設定なら機能ごと無効（矢印は出ない）。既定パスは持たない。
@@ -428,12 +429,31 @@ function tailLines(file, bytes) {
   }
 }
 
-// 1 ディレクトリから「最後に書かれた外注 1 件」を返す（時間の窓はここでは見ない）
+// この外注が「このセッションのもの」か。呼び出し元は payload.claude_session_id で見分ける。
+//
+// **イベントログはホスト全体で 1 本。** 見分けないと、常駐ボットや cron の外注も、
+// 別のセッションの外注も、同じホストのすべてのセッションに「自分の外注」として出る
+// （2026-11-25 実機: 常駐ジョブが十数分おきに外注するホストで、外注していない
+// セッションに矢印が出続けた）。
+//
+// Claude Code は起動するコマンドへ CLAUDE_CODE_SESSION_ID を渡す。値は statusline が
+// stdin で受け取る session_id と同じなので、書き手がそれを記録すれば突き合わせられる。
+//   文字列   … そのセッションからの外注。自分の session_id と一致したときだけ採る
+//   null     … Claude Code の外（常駐ボット・cron 等）からの外注。どのセッションにも出さない
+//   キー無し … 呼び出し元を記録しない書き手。従来どおり採る（記録しないゲートウェイでも矢印を出すため）
+function isOwnRoute(p, sessionId) {
+  if (!Object.prototype.hasOwnProperty.call(p, 'claude_session_id')) return true;
+  const sid = p.claude_session_id;
+  return typeof sid === 'string' && sid !== '' && sid === sessionId;
+}
+
+// 1 ディレクトリから「このセッションが最後に書いた外注 1 件」を返す（時間の窓はここでは見ない）
 //
 // 行は追記順＝時系列なので、末尾から遡って最初に当たった 1 件が「最新の状態」。
 // 生成開始（in_flight:true）の後に完了行が来ていれば、完了行の方が後ろにあるので
 // 自然に勝つ。完了行がまだ無ければ開始行に当たり、「生成中」を出せる。
-function latestRouteIn(dir) {
+// 他のセッションの行は読み飛ばすので、その後ろにある自分の行まで遡れる。
+function latestRouteIn(dir, sessionId) {
   for (const off of [0, -1]) { // JST の日跨ぎ直後は前日ファイルにも当たる
     const lines = tailLines(path.join(dir, `events_${jstDateStr(off)}.jsonl`), ROUTE_TAIL_BYTES);
     for (let i = lines.length - 1; i >= 0; i--) {
@@ -444,6 +464,7 @@ function latestRouteIn(dir) {
       const p = e && e.payload;
       if (!p || (p.backend !== 'openrouter' && p.backend !== 'comfyui') || !p.model) continue;
       if (p.provider && ROUTE_IGNORE.has(p.provider)) continue; // テスト用の偽サーバ
+      if (!isOwnRoute(p, sessionId)) continue; // 別セッション・セッション外（常駐ジョブ等）の外注
       const ts = Date.parse(e.timestamp);
       if (!Number.isFinite(ts)) continue;
       return {
@@ -455,13 +476,13 @@ function latestRouteIn(dir) {
   return null;
 }
 
-// 直近の外注を 1 件返す（無ければ null）。複数のイベント置き場を突き合わせ、
-// **最も新しいものを採る**。
-function readRoute(dirs) {
+// このセッションの直近の外注を 1 件返す（無ければ null）。複数のイベント置き場を
+// 突き合わせ、**最も新しいものを採る**。
+function readRoute(dirs, sessionId) {
   const now = Date.now();
   let best = null;
   for (const d of dirs) {
-    const r = latestRouteIn(d);
+    const r = latestRouteIn(d, sessionId);
     if (r && (!best || r.ts > best.ts)) best = r;
   }
   if (!best) return null;
@@ -581,9 +602,9 @@ function render(data) {
     const style = isFable(model) ? FABLE_STYLE : isOpus(model) ? OPUS_STYLE : isSonnet(model) ? SONNET_STYLE : null;
     const modelText = style ? sheen(model, style.base, style.shine) : paint(model, C.teal);
     let m = effort ? `${modelText}${C.gray}/${effortColor}${effort}${C.reset}` : modelText;
-    // OpenRouter へ外注していた場合のみ「→ 外注先モデル · 配信事業者」を足す。
+    // このセッションが外注していた場合のみ「→ 外注先モデル · 配信事業者」を足す。
     // 直近 ROUTE_WINDOW_SEC 以内に実績が無ければ何も出さない（現状の見た目のまま）。
-    const route = readRoute(eventsDirs(cwd, wtPath));
+    const route = readRoute(eventsDirs(cwd, wtPath), data.session_id);
     if (route) {
       m += ` ${C.gray}${I.route}${C.reset} ${paint(routeLabel(route.model), C.route)}`;
       // 完了前は配信事業者がまだ判らないので、代わりに「生成中」を示す。

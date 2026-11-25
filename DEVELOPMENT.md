@@ -224,9 +224,37 @@ compare-and-swap（保存時に Keychain の refresh token が自分の POST し
 - ファイル**末尾 64KB だけ**を `openSync` + `readSync` で読む。ログが肥大しても読み込み量は一定
 - 先頭行は途中で切れているため捨てる
 - `JSON.parse` の前に `indexOf('"openrouter"')` で粗フィルタ。実測 0.110ms/回
-- 後方から走査し、**最初に見つかった 1 件**が窓外なら何も出さずに打ち切る（さらに古い行は見ない）
+- 後方から走査し、**このセッションの外注で最初に見つかった 1 件**が窓外なら何も出さずに打ち切る（さらに古い行は見ない）
 - ファイル名は JST 日付。日跨ぎ直後に取りこぼさないよう前日ファイルも見る（`[0, -1]` の 2 日分）。
   `jstDateStr()` は UTC から固定オフセットで計算するため、**マシンの TZ 設定に依存しない**
+
+### セッションで絞る (2026-11-25)
+
+**起きたこと。** 常駐ボットが十数分おきに OpenRouter へ外注しているホストで、外注していないセッションに
+`Opus → DeepSeek V4 Flash · DeepInfra` が出続けた。別の端末から同じセッションを見ても同じで、端末や IDE の
+問題ではなかった。そのホストのイベントログを集計すると、2 か月分の外注のほぼ全件が常駐ジョブで、
+対話セッションからの外注は 1 件だけだった。同じ作りなので、別のセッションの外注も混ざる。
+
+**原因。** イベントログはホストに 1 本で、`readRoute()` は「ホストで直近に外注されたもの」を出していた。
+どのセッションの外注かを見分ける項目が、イベントに無かった。
+
+**直し方。** 書き手に呼び出し元のセッションを `payload.claude_session_id` へ書いてもらい、`isOwnRoute()` で
+stdin の `session_id` と突き合わせる。Claude Code は起動するコマンドへ `CLAUDE_CODE_SESSION_ID` を渡し、
+値は stdin の `session_id` と同じなので（worktree のマーカーと同じ前提）、書き手はそれを写すだけでよい。
+
+| `claude_session_id` | 意味 | 扱い |
+| --- | --- | --- |
+| 文字列 | そのセッションからの外注 | 一致したときだけ採る |
+| `null` / 空文字 | Claude Code の外（常駐ボット・cron）からの外注 | 採らない |
+| キー無し | 呼び出し元を記録しない書き手 | 従来どおり採る |
+
+- **キー無しを従来どおりにしたのは後方互換のため。** 公開版の利用者のゲートウェイはこのキーを書かない。
+  キー無しを捨てると、その人たちの矢印が全部消える。ここは `planName` の「キー無し = まだ書いていない」と同じ考え方
+- そのため、**書き手が `null` を書き始めるまで症状は直らない。** 書き手は環境変数が無いときもキーを省かず `null` を書く
+- 他のセッションの行は読み飛ばして遡るので、自分の外注の後ろに常駐ジョブや別セッションの外注が続いても、自分の外注を出せる
+- 遡る量は増える。自分の行が当日分に無いと前日分も読むため、常駐ジョブが多いホストの実ログ（1 日 約 2.8MB）で
+  最悪 0.13ms → 0.3ms/回になった。描画を遅らせる「数百 ms」の桁からは十分遠いので、読み取りの最適化はしていない
+- stdin に `session_id` が無い（古い本体・手で流したテスト入力）ときは、キー無しの行だけを出す
 
 ## 残額の算出
 
@@ -272,17 +300,22 @@ echo '{"model":{"display_name":"Opus 5"},"effort":{"level":"xhigh"},"workspace":
 # プラン種別・週間枠・残額まで出す（要 Keychain ログイン + OPENROUTER_API_KEY）
 node usage-fetch.cjs && cat ~/.claude/statusline-usage-cache.json
 
-# 外注経路の矢印
+# 外注経路の矢印（session_id を s2 に変えると消える。claude_session_id を消すとどちらでも出る）
 D=$(mktemp -d)
 python3 -c "import json,datetime;ts=datetime.datetime.now(datetime.timezone.utc).isoformat();\
-print(json.dumps({'timestamp':ts,'payload':{'backend':'openrouter','model':'z-ai/glm-5.2','provider':'Novita'}}))" \
+print(json.dumps({'timestamp':ts,'payload':{'backend':'openrouter','model':'z-ai/glm-5.2','provider':'Novita','claude_session_id':'s1'}}))" \
   > "$D/events_$(date +%F).jsonl"
-echo '{"model":{"display_name":"Opus 5"},"workspace":{"current_dir":"/tmp/demo"},"context_window":{"used_percentage":38}}' \
+echo '{"session_id":"s1","model":{"display_name":"Opus 5"},"workspace":{"current_dir":"/tmp/demo"},"context_window":{"used_percentage":38}}' \
   | STATUSLINE_EVENTS_DIR="$D" node statusline.cjs
 ```
 
 必ず通すパターン: ①外注なし ②窓内に外注あり ③別モデルへの外注 ④窓外（矢印が消える）
 ⑤除外対象の事業者のみ（矢印が出ない）⑥イベントディレクトリ不在 ⑦`openrouter` を含まない旧キャッシュ。
+セッションの絞り込みは、変更前の `statusline.cjs` と同じ入力で並べて差分を見る。
+⑧自分のセッションの外注（出る）⑨別セッションの外注だけ（出ない）⑩`null` の外注だけ（出ない）
+⑪自分の外注の後ろに `null` と別セッションの外注が続く（自分の外注が出る）⑫自分は窓外で `null` が窓内（出ない）
+⑬自分の生成中（`⋯`）と別セッションの生成中（出ない）⑭空文字（出ない）⑮stdin に `session_id` が無い
+（キー無しの行だけ出る）⑯キー無しの行は ②〜⑤ とも変更前と同じ表示になる。
 
 古さ表示は、キャッシュを退避してから `anthropic.lastSuccessAt` を巻き戻して確認する。
 
